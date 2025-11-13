@@ -1,0 +1,8 @@
+langchain
+langchain-google-genai
+playwright
+apscheduler
+praw
+httpx
+beautifulsoup4
+python-dotenv
