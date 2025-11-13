@@ -7,16 +7,17 @@ Run as: python -m nfp_agent.main [COMMAND]
 import argparse
 import sys
 import os
+
+# --- THIS IS THE FIX ---
+# We use relative imports (the leading dot ".") to tell main.py 
+# to look for "core" and "agents" in its own directory.
 from .core.database import (
     init_db, 
     add_target, 
-    list_targets, 
-    get_content_by_target
+    list_targets
 )
-
-# This is a bit of a trick to make sure our script can find
-# the 'core', 'agents', and 'tools' modules.
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from .core import config
+# --- END FIX ---
 
 
 def main():
@@ -74,7 +75,7 @@ def main():
 
         elif args.command == "add_target":
             add_target(args.username, args.platform)
-            print(f"Target '{args.username}' on '{args.platform}' added.")
+            print(f"Target '{args.username}' on '{platform}' added.")
 
         elif args.command == "list_targets":
             targets = list_targets()
@@ -82,10 +83,10 @@ def main():
                 print("No targets found.")
                 return
             print(f"Tracking {len(targets)} targets:")
-            for id, username, platform, added in targets:
-                print(f"  - [{id}] {username} ({platform}) - Added: {added}")
+            for target in targets:
+                print(f"  - [{target['id']}] {target['username']} ({target['platform']}) - Added: {target['date_added']}")
         
-        # --- Placeholder Executions ---
+        # --- Placeholder Executions (Updated with relative imports) ---
         elif args.command == "run_collector":
             print("Starting Collector Daemon... (Not yet implemented)")
             # In the future: from .agents.collector_daemon import start_daemon

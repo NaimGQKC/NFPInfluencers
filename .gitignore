@@ -16,3 +16,4 @@ venv/
 /data/
 *.db
 *.log
+auth.json
