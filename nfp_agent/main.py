@@ -72,10 +72,10 @@ def main():
         if args.command == "init_db":
             init_db()
             print(f"Database 'data/surveillance.db' initialized successfully.")
-
+       
         elif args.command == "add_target":
             add_target(args.username, args.platform)
-            print(f"Target '{args.username}' on '{platform}' added.")
+            print(f"Target '{args.username}' on '{args.platform}' added.")
 
         elif args.command == "list_targets":
             targets = list_targets()

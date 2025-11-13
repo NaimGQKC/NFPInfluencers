@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import random 
 from playwright.async_api import async_playwright
 from nfp_agent.core import config, database
 
@@ -10,6 +11,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 AUTH_FILE = config.AUTH_FILE
 
 async def login_to_instagram(browser):
+# ... (login_to_instagram function unchanged) ...
     """
     Logs into Instagram using credentials from .env
     Saves the session to auth.json to avoid logging in every time.
@@ -135,9 +137,11 @@ async def scrape_instagram_target(target_id: int, username: str):
 
             saved_count = 0
             for i in range(12): # Scrape 12 posts
-                logging.info(f"Scraping post {i+1}/12...")
-                
-                await page.wait_for_timeout(1500) 
+                # --- 2. ADD RANDOM DELAY ---
+                # Wait a random time between 2.5 and 5 seconds to act human
+                human_wait_ms = random.randint(2500, 5000)
+                logging.info(f"Scraping post {i+1}/12... (waiting {human_wait_ms}ms)")
+                await page.wait_for_timeout(human_wait_ms) 
                 
                 # --- THIS IS THE FIX: TAKE A SCREENSHOT ---
                 screenshot_path = f"debug_post_{i+1}.png"
@@ -146,7 +150,10 @@ async def scrape_instagram_target(target_id: int, username: str):
                 # --- END FIX ---
 
                 current_url = page.url
+                # --- RESTORING MISSING LINE ---
                 post_id_match = re.search(r"/(p|reel)/([^/]+)", current_url)
+                # --- END RESTORATION ---
+
                 if not post_id_match:
                     logging.warning("Could not find post ID in URL. Skipping.")
                     continue
@@ -154,9 +161,10 @@ async def scrape_instagram_target(target_id: int, username: str):
                 post_id = post_id_match.group(2)
                 content_type = 'post' if post_id_match.group(1) == 'p' else 'reel'
                 
-                if database.content_exists(post_id):
-                    logging.info(f"Post {post_id} already in DB. Ending scrape task.")
-                    break 
+                # --- POST CHECK COMMENTED OUT FOR DEBUGGING ---
+                # if database.content_exists(post_id):
+                #     logging.info(f"Post {post_id} already in DB. Ending scrape task.")
+                #     break 
 
                 content_text = "No caption found."
                 try:
@@ -182,24 +190,35 @@ async def scrape_instagram_target(target_id: int, username: str):
                 except Exception:
                     logging.warning(f"Could not extract media URL for {post_id}")
                 
-                database.save_content(
-                    target_id=target_id,
-                    platform='instagram',
-                    post_id=post_id,
-                    content_type=content_type,
-                    content_text=content_text.strip(),
-                    media_url=media_url,
-                    post_url=current_url,
-                    author_username=username
-                )
-                logging.info(f"[Collector] Saved new {content_type}: {post_id} for {username}")
-                saved_count += 1
+                # --- 3. ADD GUARDRAIL ---
+                # If we failed to get a media URL, it's likely an error page.
+                # Do not save it, and log a specific warning.
+                if not media_url:
+                    logging.warning(f"No media_url found for {post_id}. This might be a 'media error' page. Skipping save.")
+                else:
+                    database.save_content(
+                        target_id=target_id,
+                        platform='instagram',
+                        post_id=post_id,
+                        content_type=content_type,
+                        content_text=content_text.strip(),
+                        media_url=media_url,
+                        post_url=current_url,
+                        author_username=username
+                    )
+                    logging.info(f"[Collector] Saved new {content_type}: {post_id} for {username}")
+                    saved_count += 1
 
                 try:
-                    next_button = page.locator('._abl-').last
-                    await next_button.click()
+                    # Add a small random wait before clicking next
+                    await page.wait_for_timeout(random.randint(500, 1500))
+                    
+                    # --- FIX: Use keyboard navigation instead of selector click ---
+                    logging.info("Attempting to move to the next post via Right Arrow key...")
+                    await page.keyboard.press('ArrowRight')
+                    
                 except Exception:
-                    logging.info("No 'Next' button found. Assuming end of posts.")
+                    logging.info("No 'Next' button found (or keyboard failed). Assuming end of posts.")
                     break 
             
             logging.info(f"Scrape complete for {username}. Found {saved_count} new posts.")
