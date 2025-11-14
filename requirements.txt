@@ -6,3 +6,5 @@ praw
 httpx
 beautifulsoup4
 python-dotenv
+pyyaml
+google-generativeai

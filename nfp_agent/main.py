@@ -7,6 +7,7 @@ Run as: python -m nfp_agent.main [COMMAND]
 import argparse
 import sys
 import os
+import logging # Added logging
 
 # --- THIS IS THE FIX ---
 # We use relative imports (the leading dot ".") to tell main.py 
@@ -17,10 +18,19 @@ from .core.database import (
     list_targets
 )
 from .core import config
-# --- END FIX ---
+# --- ADDED AGENT IMPORTS ---
+# We now import the agent functions to be called
+from .agents import investigator_agent
+# --- END IMPORTS ---
 
 
 def main():
+    # --- Setup Logging ---
+    # We set this up so all our modules log to the same standard
+    logging.basicConfig(level=logging.INFO, 
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S')
+
     parser = argparse.ArgumentParser(
         description="NFPInfluencers Deceptive Marketing Agent."
     )
@@ -48,10 +58,12 @@ def main():
         "run_collector", help="Start the 24/7 collector daemon."
     )
     
+    # --- THIS IS THE UPDATE ---
     parser_investigate = subparsers.add_parser(
         "run_investigator", help="Scan the database for legal violations."
     )
     parser_investigate.add_argument("target_username", type=str, help="The username to investigate.")
+    # --- END UPDATE ---
 
     parser_outreach = subparsers.add_parser(
         "run_outreach", help="Scan Reddit for victims and send DMs."
@@ -71,44 +83,47 @@ def main():
     try:
         if args.command == "init_db":
             init_db()
-            print(f"Database 'data/surveillance.db' initialized successfully.")
+            logging.info(f"Database 'data/surveillance.db' initialized successfully.")
        
         elif args.command == "add_target":
             add_target(args.username, args.platform)
-            print(f"Target '{args.username}' on '{args.platform}' added.")
+            logging.info(f"Target '{args.username}' on '{args.platform}' added.")
 
         elif args.command == "list_targets":
             targets = list_targets()
             if not targets:
-                print("No targets found.")
+                logging.info("No targets found.")
                 return
-            print(f"Tracking {len(targets)} targets:")
+            logging.info(f"Tracking {len(targets)} targets:")
             for target in targets:
-                print(f"  - [{target['id']}] {target['username']} ({target['platform']}) - Added: {target['date_added']}")
+                # Use logging instead of print
+                logging.info(f"  - [{target['id']}] {target['username']} ({target['platform']}) - Added: {target['date_added']}")
         
         # --- Placeholder Executions (Updated with relative imports) ---
         elif args.command == "run_collector":
-            print("Starting Collector Daemon... (Not yet implemented)")
+            logging.info("Starting Collector Daemon... (Not yet implemented)")
             # In the future: from .agents.collector_daemon import start_daemon
             # start_daemon()
 
+        # --- THIS IS THE UPDATE ---
         elif args.command == "run_investigator":
-            print(f"Investigating '{args.target_username}'... (Not yet implemented)")
-            # In the future: from .agents.investigator_agent import run_investigation
-            # run_investigation(args.target_username)
+            logging.info(f"--- Running Investigator Agent for '{args.target_username}' ---")
+            investigator_agent.run_investigation(args.target_username)
+            logging.info(f"--- Investigator Agent finished for '{args.target_username}' ---")
+        # --- END UPDATE ---
 
         elif args.command == "run_outreach":
-            print(f"Running outreach for '{args.product_name}'... (Not yet implemented)")
+            logging.info(f"Running outreach for '{args.product_name}'... (Not yet implemented)")
             # In the future: from .agents.outreach_agent import run_outreach
             # run_outreach(args.product_name)
 
         elif args.command == "build_case":
-            print(f"Building case for '{args.target_username}'... (Not yet implemented)")
+            logging.info(f"Building case for '{args.target_username}'... (Not yet implemented)")
             # In the future: from .tools.case_builder import build_case
             # build_case(args.target_username)
 
     except Exception as e:
-        print(f"An error occurred: {e}", file=sys.stderr)
+        logging.error(f"An error occurred: {e}", exc_info=True) # Added exc_info for better debugging
         sys.exit(1)
 
 if __name__ == "__main__":

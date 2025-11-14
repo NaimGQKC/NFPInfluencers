@@ -1,0 +1,89 @@
+# nfp_agent/agents/legal_provisions.yaml
+# ----------------------------------------------------------------------
+# This file serves as the knowledge base (RAG Context) for the 
+# Investigator Agent. It is populated with real, citable text
+# from Canadian regulatory bodies.
+# ----------------------------------------------------------------------
+
+# --- RAG CONTEXT ---
+# This block contains the citable legal text from Canadian regulators.
+# This text is passed directly to the LLM for grounded analysis.
+legal_context: |
+  ---
+  # PART 1: SECURITIES REGULATION (OSC & CSA)
+  ---
+  [SOURCE: NI 81-102 Investment Funds, Sec 15.14 (1) - Prohibited Representations]
+  "A person or company must not state or imply in a sales communication that 
+  an investment fund's performance is guaranteed or is likely to be met."
+
+  [SOURCE: NI 81-102 Investment Funds, Sec 15.4 (3) - Required Disclosure]
+  "...Mutual funds are not guaranteed, their values change frequently and 
+  past performance may not be repeated."
+
+  [SOURCE: OSC Staff Notice 33-760 - Digital Engagement Practices]
+  "Examples of concerning practices observed... included unsubstantiated or overly 
+  promotional language and a lack of evidence to support such claims. For example: 
+  Claims such as “low fees,” “lowest fees,” or... source on incomplete or 
+  unsupported information."
+
+  [SOURCE: CSA Staff Notice 51-348 - Social Media Use]
+  "...disclosure provided by issuers on social media was either untrue or promotional 
+  to such an extent that it could have misled investors... For example, this 
+  occurred when figures being disclosed on social media were non-GAAP financial 
+  measures which had not been disclosed in any regulatory filings... investors... 
+  can result in their being misled..."
+
+  [SOURCE: OSC Rule 31-505, Sec 2.1 - General Duty]
+  "Registrants are obligated to deal fairly, honestly and in good faith with 
+  their clients... which extends to any marketing claims or messages provided."
+
+  [SOURCE: Joint CSA/IIROC Staff Notice 21-330 - Crypto-Trading Platforms]
+  "This Notice provides guidance for CTPs on how requirements under securities 
+  legislation... relating to advertising, marketing and the use of social 
+  media may apply to them."
+
+  ---
+  # PART 2: COMPETITION & ADVERTISING LAW (Competition Bureau & Ad Standards)
+  ---
+  [SOURCE: Competition Act, R.S.C. 1985, c. C-34, Sec 74.01 (1)(a)]
+  "74.01 (1) A person engages in reviewable conduct who... (a) makes a 
+  representation to the public that is false or misleading in a material respect;"
+
+  [SOURCE: Competition Act, R.S.C. 1985, c. C-34, Sec 74.01 (1)(b)]
+  "(b) makes a representation to the public in the form of a statement, warranty 
+  or guarantee of the performance... of a product that is not based on an 
+  adequate and proper test thereof, the proof of which lies on the person 
+  making the representation;"
+
+  [SOURCE: Competition Bureau - "Influencer marketing and the Competition Act"]
+  "Your connections may be 'material' if they have the potential to affect 
+  how consumers evaluate your independence from a brand... Make sure that 
+  your disclosures are as visible as possible... Your audience may not see 
+  them if they are in a long caption, group of hashtags, or a profile bio."
+
+  [SOURCE: Ad Standards - Interpretation Guideline #5 (Testimonials)]
+  "...must disclose any 'material connection'... that fact and the nature of 
+  the material connection must be clearly and prominently disclosed in 
+  close proximity to the representation..."
+
+  [SOURCE: Competition Act, R.S.C. 1985, c. C-34, Sec 74.02 (Testimonials)]
+  "74.02 A person engages in reviewable conduct who... publishes a testimonial 
+  with respect to a product, unless the person... can establish that... (b) 
+  such a... testimonial was, before being made or published, approved and 
+  permission to make or publish it was given in writing by the person..."
+
+  [SOURCE: Canadian Code of Advertising Standards, Clause 7 (Testimonials)]
+  "7. Testimonials... must reflect the genuine, reasonably current opinion 
+  of the individual... and must be based upon adequate information about or 
+  experience with the identified product..."
+
+# --- MOCK EVIDENCE ---
+# This text simulates a video transcript for testing the RAG analysis.
+mock_scam_transcript: |
+  "Hey everyone, so you all know I'm a full-time trader, and 
+  I just found this brand new crypto token, 'MegaCoin'. 
+  Honestly, this is not financial advice, but I'm telling you,
+  this thing is a guaranteed 100x rocket. I put $50k in.
+  The team is anonymous which is good for security.
+  You can't lose. Swipe up, link in my bio, let's get rich.
+  Don't miss out on this, it's a once-in-a-lifetime passive income stream. #ad"
