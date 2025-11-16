@@ -4,9 +4,7 @@ import os
 import re
 import random 
 import argparse # For CLI options
-from playwright.async_api import async_playwright
-# Use absolute import to correctly reference the 'core' module outside the 'tools' package
-from ..core import config, database 
+from playwright.async_api import async_playwright, Page, BrowserContext
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -15,7 +13,7 @@ AUTH_FILE = config.AUTH_FILE
 # --- FIXED TEST TARGET (from user) ---
 AD_KEYWORDS = [
     "#GrowingUpAnimal",
-    "@debeersgroup" # NEW: Based on user finding (case-insensitive check will handle this)
+    "@debeersgroup" # Case-insensitive check handles this
 ]
 # --- END FIXED TEST TARGET ---
 
@@ -67,10 +65,10 @@ async def login_to_instagram(browser):
     return True
 
 
-async def scrape_instagram_stories(page, target_id: int, username: str):
+async def scrape_instagram_stories(page: Page, target_id: int, username: str):
     """
-    SCRAPER MODE 5: "NETWORK INTERCEPT" (V1.5 - Robust)
-    This worked even when the UI failed. This is the correct method.
+    SCRAPER MODE 5: "NETWORK INTERCEPT" (V1.8 - "Click-to-Open")
+    This clicks the story and uses your human-like random wait.
     """
     logging.info(f"[Story Collector] Starting network intercept scrape for: {username}")
     
@@ -90,14 +88,12 @@ async def scrape_instagram_stories(page, target_id: int, username: str):
 # --- NEW, ROBUST CLICK SELECTOR (Based on your HTML screenshot) ---
         # We find the div with role="button" that contains the canvas (the story ring).
         profile_pic_selector = f'div[role="button"]:has(canvas)'
-        logging.info(f"Looking for story button with selector: {profile_pic_selector}")
-        
+        logging.info(f"Looking for story button with selector: {profile_pic_selector}")            
         await page.wait_for_selector(profile_pic_selector, timeout=5000)
         await page.locator(profile_pic_selector).first.click()
         logging.info("Clicked profile picture to open stories.")
-        # --- END NEW SELECTOR ---
-        
-        # 2. Wait for story modal
+
+        # 2. Wait for story modal (This is the mandatory URL check you requested)
         await page.wait_for_url("https://www.instagram.com/stories/**", timeout=10000)
         logging.info("Story modal is open. Starting burst scrape...")
 
@@ -116,8 +112,9 @@ async def scrape_instagram_stories(page, target_id: int, username: str):
         logging.info(f"Burst scrape complete. Found {len(intercepted_media)} unique media items.")
 
     except Exception as e:
-        if "timeout" in str(e).lower():
-            logging.info(f"[Story Collector] No stories found for {username} (or selector failed).")
+        # If the click or URL wait fails, this is where we end up.
+        if "timeout" in str(e).lower() or "await page.wait_for_url" in str(e):
+            logging.error("https://www.linguee.com.ar/ingles-espanol/traduccion/check+failed.html Story modal failed to open. Check credentials/locale.")
         else:
             logging.error(f"[Story Collector] Error scraping stories: {e}")
             await page.screenshot(path="debug_story_failure.png")
@@ -135,7 +132,6 @@ async def scrape_instagram_stories(page, target_id: int, username: str):
             if not database.content_exists(post_id):
                 content_type = 'story_video' if '.mp4' in media_url else 'story_image'
                 
-                # --- THIS IS THE FIX for the TypeError ---
                 database.save_content(
                     target_id=target_id,
                     platform='instagram',
@@ -146,7 +142,6 @@ async def scrape_instagram_stories(page, target_id: int, username: str):
                     post_url=f"https://www.instagram.com/stories/{username}/", # Generic URL
                     author_username=username
                 )
-                # --- END THE FIX ---
                 saved_count += 1
         
         logging.info(f"[Story Collector] Saved {saved_count} new story items to DB.")
@@ -176,7 +171,7 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
         context = await browser.new_context(
             storage_state=AUTH_FILE,
             viewport={'width': 1280, 'height': 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+            user_agent="Mozilla.5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
 
@@ -203,7 +198,7 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
 
         # --- 3. GATHER ALL POSTS (with CLI flag) ---
         if not skip_posts:
-            await page.goto(profile_url)
+            await page.goto(profile_url) # Go back to profile
 
             posts_to_scrape = []
             try:
@@ -264,6 +259,7 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
             saved_count = 0
             for post_url, alt_text in filtered_posts:
                 network_handler = None 
+                post_page = None
                 try:
                     post_id_match = re.search(r"/(p|reel)/([^/]+)", post_url)
                     if not post_id_match: continue
@@ -275,14 +271,9 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
                         logging.info(f"Post {post_id} already in DB. Skipping full scrape.")
                         continue
 
-                    # --- NEW "HUMAN CLICK" LOGIC ---
-                    logging.info(f"Attempting to click post: {post_url}")
-                    
-                    # Find the specific link on the page and click it
-                    post_link_selector = f'a[href="{post_url.replace("https://www.instagram.com", "")}"]'
-                    await page.locator(post_link_selector).first.click()
-                    
-                    logging.info("  > Clicked post. Waiting for modal...")
+                    # --- NEW "NEW TAB" STRATEGY ---
+                    logging.info(f"Opening post in new tab: {post_url}")
+                    post_page = await context.new_page()
                     
                     media_url = None
                     content_type_from_intercept = None
@@ -295,22 +286,24 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
                                 media_url = request.url
                                 content_type_from_intercept = 'reel'
 
-                    page.on("request", network_handler)
+                    await post_page.on("request", network_handler)
                     
-                    # Wait for the modal to open and load
+                    # Go to the post page in the new tab
+                    await post_page.goto(post_url)
+                    
                     try:
-                        await page.wait_for_selector('textarea', timeout=10000)
-                        logging.info("  > Modal is loaded. Waiting 10s for media...")
-                        await page.wait_for_timeout(10000)
+                        await post_page.wait_for_selector('textarea', timeout=10000)
+                        logging.info("  > Post page is loaded. Waiting 10s for media...")
+                        await post_page.wait_for_timeout(10000)
                     except Exception:
                         logging.warning("  > Could not find comment box, but continuing...")
 
-                    page.remove_listener("request", network_handler)
-                    # --- END "HUMAN CLICK" LOGIC ---
+                    await post_page.remove_listener("request", network_handler)
+                    # --- END "NEW TAB" STRATEGY ---
 
                     content_text = alt_text # Default
                     try:
-                        caption_element = page.locator('h1').first
+                        caption_element = post_page.locator('h1').first
                         await caption_element.wait_for(state="visible", timeout=10000)
                         content_text = await caption_element.text_content()
                     except Exception:
@@ -319,7 +312,7 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
                     next_button_selector = 'button._afxw._al46._al47'
                     is_carousel = False
                     try:
-                        await page.locator(next_button_selector).wait_for(state="visible", timeout=2000)
+                        await post_page.locator(next_button_selector).wait_for(state="visible", timeout=2000)
                         is_carousel = True
                     except Exception:
                         is_carousel = False
@@ -331,7 +324,7 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
                             logging.warning("  > Network intercept failed for reel. Falling back to thumbnail...")
                         try:
                             # Inside modal, the selector is different
-                            img_elements = await page.locator('div[role="dialog"] img[style*="object-fit"]').all()
+                            img_elements = await post_page.locator('img[style*="object-fit"]').all()
                             for el in img_elements:
                                 if await el.is_visible():
                                     img_src = await el.get_attribute("src")
@@ -347,6 +340,7 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
 
                     if not media_url:
                         logging.warning(f"  > No media_url found for {post_id}. Skipping save.")
+                        await post_page.close()
                         continue
                         
                     database.save_content(
@@ -362,32 +356,25 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
                     logging.info(f"[Collector] Saved new {content_type}: {post_id} for {username}")
                     saved_count += 1
                     
-                    # Click close button to return to grid
-                    await page.locator('svg[aria-label="Cerrar"]').click()
+                    # Close the tab
+                    await post_page.close()
                     
                 except Exception as e:
                     try:
+                        if post_page: await post_page.close()
                         page.remove_listener("request", network_handler)
                     except Exception:
                         pass 
                     logging.error(f"  > Failed to scrape post page {post_url}: {e}")
                     await page.screenshot(path=f"debug_post_failure_{post_id}.png")
-                    # Go back to profile page to reset state
-                    await page.goto(profile_url)
-
 
             logging.info(f"Smart Scrape complete for {username}. Saved {saved_count} new items.")
-        
         else:
             logging.info("[CLI] Skipping post scraping.")
 
-        # --- 5. CLEANUP ---
-        await context.close()
-        await browser.close()
-        logging.info("Browser closed. Task finished.")
+    # --- NO BROWSER CLEANUP - Main() will handle it ---
 
 
-# This block allows us to run and test this file directly
 async def main():
     # --- NEW: CLI Argument Parser ---
     parser = argparse.ArgumentParser(description="NFPInfluencers Instagram Scraper")

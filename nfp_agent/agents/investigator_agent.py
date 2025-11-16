@@ -5,9 +5,12 @@ import os
 import datetime
 from pathlib import Path 
 import yaml 
+import httpx # For downloading video
+import google.generativeai as genai # NEW: For transcription
 from ..core import config, database 
 
 # --- LangChain & Gemini Imports ---
+# We still use LangChain for the *analysis* part
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -15,9 +18,18 @@ from langchain_core.output_parsers import StrOutputParser
 # --- GLOBAL YAML CONFIG PATH ---
 YAML_CONFIG_PATH = Path(__file__).parent / "legal_provisions.yaml"
 
+# --- Media Download Config ---
+MEDIA_DIR = config.BASE_DIR / "data" / "media"
+os.makedirs(MEDIA_DIR, exist_ok=True)
+
+# --- NEW: Configure the Gemini API client ---
+if config.GEMINI_API_KEY:
+    genai.configure(api_key=config.GEMINI_API_KEY)
+else:
+    logging.warning("GEMINI_API_KEY not found. Transcription and analysis will fail.")
 
 def _load_yaml_config():
-    """Loads the legal provisions and mock data from the YAML file."""
+    """Loads the legal provisions from the YAML file."""
     try:
         with open(YAML_CONFIG_PATH, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
@@ -47,7 +59,6 @@ def _get_content_for_target(target_id: int) -> list:
             return []
         
         logging.info(f"Found {len(content_rows)} pieces of content.")
-        # Convert sqlite3.Row objects to standard dicts
         return [dict(row) for row in content_rows]
     except Exception as e:
         logging.error(f"Error querying content for target {target_id}: {e}")
@@ -62,34 +73,81 @@ def _load_rag_context(config_data: dict) -> str:
     logging.info("Loading REAL legal context (RAG) from YAML...")
     return config_data['legal_context']
 
-def _transcribe_video_mock(config_data: dict, media_url: str) -> str:
+# --- NEW: Real Transcription Function (using Gemini) ---
+def _transcribe_video_real(post_id: str, media_url: str) -> str:
     """
-    Returns a hard-coded "scam" transcript from the YAML data.
+    Downloads a video and transcribes it using the Gemini API.
+    Returns the transcribed text.
     """
-    logging.warning(f"Using MOCK transcription for {media_url}")
-    return config_data['mock_scam_transcript']
+    if not genai:
+        logging.error("Gemini API not configured. Skipping transcription.")
+        return "[Transcription Failed: API not configured]"
+        
+    logging.info(f"Starting transcription for {post_id}...")
+    
+    # We use .mp4 extension for all videos, regardless of original type
+    video_path = MEDIA_DIR / f"{post_id}.mp4" 
+    
+    try:
+        # --- 1. Download Video ---
+        if not os.path.exists(video_path):
+            logging.info(f"  > Downloading video: {media_url}")
+            # Use httpx with follow_redirects for CDN links
+            with httpx.stream("GET", media_url, timeout=30.0, follow_redirects=True) as response:
+                response.raise_for_status() 
+                with open(video_path, "wb") as f:
+                    for chunk in response.iter_bytes():
+                        f.write(chunk)
+            logging.info(f"  > Video saved to: {video_path}")
+        else:
+            logging.info(f"  > Video already downloaded: {video_path}")
+
+        # --- 2. Upload and Transcribe with Gemini ---
+        logging.info("  > Uploading video to Gemini for transcription...")
+        
+        # Uploads the file to the Gemini API (temporary file)
+        video_file = genai.upload_file(path=video_path, display_name=post_id)
+        logging.info("  > Upload complete. Waiting for transcription...")
+
+        # Transcribe with Gemini 2.5 Flash
+        model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+        
+        response = model.generate_content([
+            "Transcribe the audio from this video. Only return the full, raw transcript and nothing else.",
+            video_file
+        ])
+        
+        # Clean up the temporary file from Google's side immediately
+        genai.delete_file(video_file.name)
+
+        transcript = response.text.strip()
+        if not transcript:
+            transcript = "[Transcription empty or video has no audio]"
+            
+        logging.info(f"  > Transcription complete for {post_id}.")
+        return transcript
+
+    except httpx.RequestError as e:
+        logging.error(f"  > Download failed for {post_id}: {e}")
+        return "[Transcription Failed: Download error]"
+    except Exception as e:
+        logging.error(f"  > An unknown transcription error occurred for {post_id}: {e}")
+        return f"[Transcription Failed: {e}]"
 
 def run_investigation(target_username: str):
     """
     The main entry point for the Investigator Agent.
-    - Loads RAG context (real) from YAML.
-    - Gets content from the DB.
-    - Transcribes videos (mock).
-    - Analyzes text for violations using an LLM.
-    - Saves analysis to a file.
     """
     logging.info(f"--- Starting Investigation for: {target_username} ---")
     
     # 1. Validate Config & Load YAML
-    # NOTE: You must run `pip install -r requirements.txt` before running this,
-    # as the `pyyaml` library is now required.
-    if not config.validate_config(required_keys=["GEMINI_API_KEY"]):
+    if not config.GEMINI_API_KEY:
         logging.error("GEMINI_API_KEY not configured. Exiting.")
         return
         
-    config_data = _load_yaml_config() # Load all data from YAML
+    config_data = _load_yaml_config() 
 
-    # 2. Initialize LLM (Gemini 2.5 Flash for cost)
+    # 2. Initialize LangChain LLM (for RAG analysis)
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash", 
         temperature=0.1,
@@ -150,7 +208,6 @@ def run_investigation(target_username: str):
     # 7. Iterate, Transcribe, and Analyze
     logging.info(f"--- Analyzing {len(content_list)} pieces of content ---")
     
-    # Create the output directory: data/investigations/[target_username]
     output_dir = config.BASE_DIR / "data" / "investigations" / target_username
     os.makedirs(output_dir, exist_ok=True)
     logging.info(f"Output folder created at: {output_dir}")
@@ -160,25 +217,34 @@ def run_investigation(target_username: str):
         logging.info(f"Investigating post: {post_id} ({content['post_url']}) (Type: {content['content_type']})")
         
         caption = content['content_text']
-        # Pass the config_data to the mock function to get the transcript
-        transcript = _transcribe_video_mock(config_data, content['media_url']) 
+        transcript = "[Media is an image, no audio.]" # Default
+
+        content_type = content['content_type']
+        media_url = content['media_url']
+        
+        # --- NEW TRANSCRIPTION LOGIC ---
+        if content_type == 'story_video' or (media_url and '.mp4' in media_url):
+            logging.info("  > Video media detected. Attempting transcription...")
+            # This now calls the Gemini API transcribe function
+            transcript = _transcribe_video_real(post_id, media_url)
+        else:
+            logging.info("  > No video media detected. Skipping transcription.")
+        # --- END NEW LOGIC ---
 
         # Run the RAG analysis chain
         try:
             result = chain.invoke({
                 "context": legal_context,
                 "transcript": transcript,
-                "caption": caption
+                "caption": caption if caption else "[No caption]"
             })
             
-            # --- FILE SAVING FEATURE ---
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.datetime.now().strftime("%Y%M%d_%H%M%S")
             output_file = output_dir / f"analysis_{post_id}_{timestamp}.txt"
             
             with open(output_file, "w", encoding="utf-8") as f:
                 f.write(result)
             logging.info(f"  > Analysis saved to: {output_file}")
-            # --- END FILE SAVING ---
 
         except Exception as e:
             logging.error(f"  > Failed to analyze post {post_id}: {e}")
@@ -187,10 +253,8 @@ def run_investigation(target_username: str):
 
 
 if __name__ == "__main__":
-    # This allows us to test the agent directly
     logging.basicConfig(level=logging.INFO)
     
-    # We need to add a target to the command line args for testing
     if len(sys.argv) > 1:
         target_username = sys.argv[1]
         run_investigation(target_username)
