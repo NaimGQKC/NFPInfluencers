@@ -33,7 +33,7 @@ REDDIT_USER_AGENT = "NFPInfluencers Agent v0.1 by u/NaimGQKC"
 # Instagram
 IG_USERNAME = os.getenv("IG_USERNAME")
 IG_PASSWORD = os.getenv("IG_PASSWORD")
-
+IG_APP_ID = os.getenv("IG_APP_ID")
 # --- Validation Function (Now with arguments) ---
 def validate_config(required_keys: list = None):
     """Checks that all essential keys are loaded."""
@@ -51,13 +51,15 @@ def validate_config(required_keys: list = None):
         if not GEMINI_API_KEY or "YOUR_GEMINI" in GEMINI_API_KEY:
             errors.append("GEMINI_API_KEY is not set in .env")
     else:
-        # Specific check for the tool being run
         if "IG_USERNAME" in required_keys and (not IG_USERNAME or "your_burner_ig_username" in IG_USERNAME):
             errors.append("IG_USERNAME is not set in .env")
         if "IG_PASSWORD" in required_keys and (not IG_PASSWORD or "your_burner_ig_password" in IG_PASSWORD):
             errors.append("IG_PASSWORD is not set in .env")
-        if "REDDIT_CLIENT_ID" in required_keys and (not REDDIT_CLIENT_ID or "YOUR_REDDIT" in REDDIT_CLIENT_ID):
-            errors.append("REDDIT_CLIENT_ID is not set in .env")
+        # --- ADD THIS ---
+        if "IG_APP_ID" in required_keys and (not IG_APP_ID or "YOUR_IG_APP_ID_HERE" in IG_APP_ID):
+            errors.append("IG_APP_ID is not set in .env. Get this from browser dev tools.")
+        # --- END ADDITION ---
+        if "REDDIT_CLIENT_ID" in required_keys and (not REDDIT_CLIENT_ID or "YOUR_REDDIT" in REDDIT_CLIENT_ID):            errors.append("REDDIT_CLIENT_ID is not set in .env")
 
     if not errors:
         logging.info("Configuration loaded successfully.")

@@ -4,7 +4,14 @@ import os
 import re
 import random 
 import argparse # For CLI options
-from playwright.async_api import async_playwright, Page, BrowserContext
+import json
+import httpx
+from playwright.async_api import async_playwright
+# Use absolute import to correctly reference the 'core' module outside the 'tools' package
+from ..core import config, database 
+
+MEDIA_DIR = config.BASE_DIR / "data" / "media"
+os.makedirs(MEDIA_DIR, exist_ok=True)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -13,7 +20,7 @@ AUTH_FILE = config.AUTH_FILE
 # --- FIXED TEST TARGET (from user) ---
 AD_KEYWORDS = [
     "#GrowingUpAnimal",
-    "@debeersgroup" # Case-insensitive check handles this
+    "@debeersgroup" # NEW: Based on user finding (case-insensitive check will handle this)
 ]
 # --- END FIXED TEST TARGET ---
 
@@ -65,56 +72,88 @@ async def login_to_instagram(browser):
     return True
 
 
-async def scrape_instagram_stories(page: Page, target_id: int, username: str):
+async def scrape_instagram_stories(page, target_id: int, username: str):
     """
-    SCRAPER MODE 5: "NETWORK INTERCEPT" (V1.8 - "Click-to-Open")
-    This clicks the story and uses your human-like random wait.
+    SCRAPER MODE 6: "PASSIVE COLLECTION" (V1.7 - Anti-Ban)
+    This clicks the story ring and then waits passively, letting stories
+    auto-play to trigger network requests for full-res media.
     """
-    logging.info(f"[Story Collector] Starting network intercept scrape for: {username}")
+    logging.info(f"[Story Collector] Starting PASSIVE network scrape for: {username}")
     
-    intercepted_media = set() # Use a set to avoid duplicates
+    # Use a dict to store structured data {post_id: {path: '...', type: '...'}}
+    intercepted_media = {} 
 
-    def story_network_handler(request):
-        """Listen for story media files"""
+    async def story_network_handler(request):
+        """Listen for story media files and save them to disk."""
+        
+        # --- THIS IS THE FIX ---
+        # If we aren't in the story modal, ignore all requests.
+        if "/stories/" not in page.url:
+            return
+        # --- END THE FIX ---
+
         url = request.url
-        if "scontent" in url and ('.mp4' in url or '.jpg' in url) and "PREVIEW" not in url:
-            if request.resource_type in ("media", "image", "other"):
-                logging.info(f"  > [STORY NETWORK] Intercepted story media: {url[:70]}...")
-                intercepted_media.add(url)
+        # We are now more specific: we want video, or "image" that is NOT a preview
+        if "scontent" in url and ("PREVIEW" not in url.upper()):
+            if ('.mp4' in url) or ('.jpg' in url and "resize" not in url):
+                
+                # Create a unique ID based on the media URL hash
+                post_id = f"story_{abs(hash(url))}"
+
+                if post_id in intercepted_media:
+                    return # Already processed
+
+                try:
+                    response = await request.response()
+                    if response:
+                        buffer = await response.body()
+                        
+                        content_type = 'story_video' if '.mp4' in url else 'story_image'
+                        extension = '.mp4' if content_type == 'story_video' else '.jpg'
+                        local_path = MEDIA_DIR / f"{post_id}{extension}"
+                        
+                        with open(local_path, "wb") as f:
+                            f.write(buffer)
+                        
+                        logging.info(f"  > [STORY NETWORK] Saved asset ({content_type}): {local_path}")
+                        
+                        intercepted_media[post_id] = {
+                            'path': str(local_path), 
+                            'type': content_type
+                        }
+                        
+                except Exception as e:
+                    logging.warning(f"  > [STORY NETWORK] Failed to save asset bytes for {url}: {e}")
 
     page.on("request", story_network_handler)
 
     try:
-# --- NEW, ROBUST CLICK SELECTOR (Based on your HTML screenshot) ---
-        # We find the div with role="button" that contains the canvas (the story ring).
+        # 1. Click the story ring to open it
         profile_pic_selector = f'div[role="button"]:has(canvas)'
-        logging.info(f"Looking for story button with selector: {profile_pic_selector}")            
+        logging.info(f"Looking for story button with selector: {profile_pic_selector}")
+        
         await page.wait_for_selector(profile_pic_selector, timeout=5000)
         await page.locator(profile_pic_selector).first.click()
         logging.info("Clicked profile picture to open stories.")
-
-        # 2. Wait for story modal (This is the mandatory URL check you requested)
-        await page.wait_for_url("https://www.instagram.com/stories/**", timeout=10000)
-        logging.info("Story modal is open. Starting burst scrape...")
-
-        # 3. Burst scrape: Click "Next" N times to trigger network requests
-        stories_to_check = 15
-        for i in range(stories_to_check):
-            if "/stories/highlights/" in page.url:
-                logging.info("[Story Collector] Detected a Highlight. Ending scrape.")
-                break
-            
-            # Use the random wait as requested
-            await page.wait_for_timeout(random.randint(1000, 2500)) 
-            await page.keyboard.press('ArrowRight')
-            logging.info(f"  > Clicked Next story ({i+1}/{stories_to_check})")
         
-        logging.info(f"Burst scrape complete. Found {len(intercepted_media)} unique media items.")
+        # 2. Wait for story modal
+        await page.wait_for_url("https://www.instagram.com/stories/**", timeout=10000)
+        logging.info("Story modal is open. Starting passive collection...")
+
+        # 3. --- THIS IS THE NEW LOGIC ---
+        # Instead of "burst scraping", we wait passively for 60 seconds.
+        # The stories will auto-play, triggering the network handler.
+        # This is more human-like and allows videos to load.
+        passive_wait_ms = 6000
+        logging.info(f"Waiting {passive_wait_ms / 1000} seconds for stories to auto-play...")
+        await page.wait_for_timeout(passive_wait_ms) 
+        # --- END NEW LOGIC ---
+        
+        logging.info(f"Passive collection complete. Found {len(intercepted_media)} unique media items.")
 
     except Exception as e:
-        # If the click or URL wait fails, this is where we end up.
-        if "timeout" in str(e).lower() or "await page.wait_for_url" in str(e):
-            logging.error("https://www.linguee.com.ar/ingles-espanol/traduccion/check+failed.html Story modal failed to open. Check credentials/locale.")
+        if "timeout" in str(e).lower():
+            logging.info(f"[Story Collector] No stories found for {username} (or selector failed).")
         else:
             logging.error(f"[Story Collector] Error scraping stories: {e}")
             await page.screenshot(path="debug_story_failure.png")
@@ -123,28 +162,83 @@ async def scrape_instagram_stories(page: Page, target_id: int, username: str):
         # 4. CRITICAL: Remove the listener
         page.remove_listener("request", story_network_handler)
 
-        # 5. Save all unique media found
+        # 5. Save all unique media found (same as before)
         saved_count = 0
-        for i, media_url in enumerate(intercepted_media):
-            # Create a unique ID based on the media URL hash
-            post_id = f"story_{abs(hash(media_url))}"
-            
+        for post_id, media_data in intercepted_media.items():
             if not database.content_exists(post_id):
-                content_type = 'story_video' if '.mp4' in media_url else 'story_image'
+                local_path = media_data['path']
+                content_type = media_data['type']
                 
                 database.save_content(
                     target_id=target_id,
                     platform='instagram',
                     post_id=post_id,
                     content_type=content_type,
-                    content_text=None, # Correct argument name
-                    media_url=media_url,
-                    post_url=f"https://www.instagram.com/stories/{username}/", # Generic URL
+                    content_text=None, 
+                    media_url=local_path, # Save the local file path
+                    post_url=f"https://www.instagram.com/stories/{username}/", 
                     author_username=username
                 )
                 saved_count += 1
         
         logging.info(f"[Story Collector] Saved {saved_count} new story items to DB.")
+
+
+async def fetch_post_data_via_graphql(shortcode: str, client: httpx.AsyncClient) -> dict:
+    """
+    Fetches post/reel data using the internal GraphQL API.
+    This is based on the 'Method 2' from ahmedrangel/instagram-media-scraper.
+    """
+    logging.info(f"  > [GraphQL] Fetching post data for {shortcode}...")
+    
+    if not config.IG_APP_ID:
+        logging.error("  > [GraphQL] FATAL: IG_APP_ID not configured in .env.")
+        return {}
+
+    # These params are from the scraper_graphql.js
+    graphql_url = "https://www.instagram.com/api/graphql"
+    params = {
+        "variables": json.dumps({"shortcode": shortcode}),
+        "doc_id": "10015901848480474",
+        "lsd": "AVqbxe3J_YA", # This appears to be a static value
+    }
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-IG-App-ID": config.IG_APP_ID,
+        "X-FB-LSD": "AVqbxe3J_YA",
+        "X-ASBD-ID": "129477",
+        "Sec-Fetch-Site": "same-origin"
+    }
+
+    try:
+        response = await client.post(graphql_url, data=params, headers=headers)
+        
+        if response.status_code != 200:
+            logging.warning(f"  > [GraphQL] Failed to fetch {shortcode}. Status: {response.status_code}")
+            return {}
+
+        data = response.json()
+        items = data.get("data", {}).get("xdt_shortcode_media")
+
+        if not items:
+            logging.warning(f"  > [GraphQL] No items found in response for {shortcode}.")
+            return {}
+
+        # Extract the key data we need
+        caption_edge = items.get("edge_media_to_caption", {}).get("edges", [])
+        return {
+            "video_url": items.get("video_url"),
+            "caption": caption_edge[0]["node"]["text"] if caption_edge else "",
+            "product_type": items.get("product_type"),
+        }
+
+    except Exception as e:
+        logging.error(f"  > [GraphQL] Error fetching {shortcode}: {e}")
+        return {}
+# --- END NEW FUNCTION ---
+
 
 
 async def scrape_instagram_target(target_id: int, username: str, skip_stories=False, skip_posts=False):
@@ -171,7 +265,7 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
         context = await browser.new_context(
             storage_state=AUTH_FILE,
             viewport={'width': 1280, 'height': 800},
-            user_agent="Mozilla.5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
 
@@ -196,11 +290,11 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
         else:
             logging.info("[CLI] Skipping story scraping.")
 
-        # --- 3. GATHER ALL POSTS (with CLI flag) ---
+# --- 3. GATHER ALL POSTS (with CLI flag) ---
         if not skip_posts:
-            await page.goto(profile_url) # Go back to profile
+            await page.goto(profile_url)
 
-            posts_to_scrape = []
+            posts_to_scrape = [] # This will be a list of (post_url, shortcode)
             try:
                 try:
                     dismiss_button = page.locator('svg[aria-label="Dismiss"]').first
@@ -216,7 +310,7 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
                     logging.info(f"Scroll {i+1}/3... waiting...")
                     await page.wait_for_timeout(random.randint(1500, 2500))
 
-                logging.info("Gathering all post links and alt texts from grid...")
+                logging.info("Gathering all post links from grid...")
                 post_links_selector = 'a[href*="/p/"], a[href*="/reel/"]'
                 post_elements = await page.locator(post_links_selector).all()
                 
@@ -228,13 +322,15 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
                         try:
                             href = await el.get_attribute("href")
                             if not href: continue
+                            
+                            # Use regex to find the shortcode
+                            post_id_match = re.search(r"/(p|reel)/([^/]+)", href)
+                            if not post_id_match: continue
+                            
+                            shortcode = post_id_match.group(2)
                             post_url = f"https://www.instagram.com{href}"
-                            img_element = el.locator('img')
-                            alt_text = await img_element.get_attribute("alt")
                             
-                            alt_text = alt_text if alt_text else "no alt text"
-                            
-                            posts_to_scrape.append((post_url, alt_text))
+                            posts_to_scrape.append((post_url, shortcode))
                         except Exception as e:
                             logging.warning(f"Could not extract post info from grid: {e}")
 
@@ -242,139 +338,82 @@ async def scrape_instagram_target(target_id: int, username: str, skip_stories=Fa
                 logging.error(f"[Collector] Error gathering posts from {username}: {e}")
                 await page.screenshot(path="debug_gather_failure.png")
 
-            # --- 4. ANALYZE & JUMP (Original "Gather then Jump" logic) ---
+            # --- 4. ANALYZE & GRAPHQL (NEW LOGIC) ---
+            # This is much faster. No browser interaction needed.
             logging.info(f"--- Analyzing {len(posts_to_scrape)} potential posts using {len(AD_KEYWORDS)} keywords ---")
             
-            filtered_posts = []
-            for post_url, alt_text in posts_to_scrape:
-                # --- FINAL BUG FIX: Case-insensitive check on BOTH sides ---
-                if any(keyword.lower() in alt_text.lower() for keyword in AD_KEYWORDS):
-                    logging.info(f"[TARGET FOUND] '{post_url}' (Reason: alt text match)")
-                    filtered_posts.append((post_url, alt_text))
-                else:
-                    logging.info(f"[Skipping] '{post_url}' (No ad keywords in alt text)")
-            
-            logging.info(f"--- Found {len(filtered_posts)} posts to scrape. Starting scrape... ---")
-            
             saved_count = 0
-            for post_url, alt_text in filtered_posts:
-                network_handler = None 
-                post_page = None
-                try:
-                    post_id_match = re.search(r"/(p|reel)/([^/]+)", post_url)
-                    if not post_id_match: continue
-                    
-                    post_id = post_id_match.group(2)
-                    content_type = 'reel' if '/reel/' in post_url else 'post'
+            # Create one HTTP client for all requests
+            async with httpx.AsyncClient() as client:
+                for post_url, post_id in posts_to_scrape:
                     
                     if database.content_exists(post_id):
-                        logging.info(f"Post {post_id} already in DB. Skipping full scrape.")
+                        logging.info(f"Post {post_id} already in DB. Skipping API call.")
+                        continue
+                    
+                    # Fetch post data (caption, video_url) from GraphQL API
+                    post_data = await fetch_post_data_via_graphql(post_id, client)
+                    
+                    caption = post_data.get("caption", "").lower()
+                    video_url = post_data.get("video_url")
+                    
+                    # Run our ad-keyword filter on the *real* caption
+                    if not any(keyword.lower() in caption for keyword in AD_KEYWORDS):
+                        logging.info(f"[Skipping] '{post_url}' (No ad keywords in caption)")
+                        continue
+                    
+                    # If it's an ad, but not a video, we skip (for now)
+                    if not video_url:
+                        logging.warning(f"[Skipping] '{post_url}' (Ad match, but no video_url found in API response)")
                         continue
 
-                    # --- NEW "NEW TAB" STRATEGY ---
-                    logging.info(f"Opening post in new tab: {post_url}")
-                    post_page = await context.new_page()
+                    logging.info(f"[TARGET FOUND] '{post_url}' (Reason: caption match)")
                     
-                    media_url = None
-                    content_type_from_intercept = None
-
-                    def network_handler(request):
-                        nonlocal media_url, content_type_from_intercept
-                        if "scontent" in request.url and ".mp4" in request.url and request.resource_type == "media":
-                            if not media_url: 
-                                logging.info(f"  > [NETWORK] Intercepted video URL: {request.url}")
-                                media_url = request.url
-                                content_type_from_intercept = 'reel'
-
-                    await post_page.on("request", network_handler)
-                    
-                    # Go to the post page in the new tab
-                    await post_page.goto(post_url)
-                    
+                    # Download the video bytes
                     try:
-                        await post_page.wait_for_selector('textarea', timeout=10000)
-                        logging.info("  > Post page is loaded. Waiting 10s for media...")
-                        await post_page.wait_for_timeout(10000)
-                    except Exception:
-                        logging.warning("  > Could not find comment box, but continuing...")
-
-                    await post_page.remove_listener("request", network_handler)
-                    # --- END "NEW TAB" STRATEGY ---
-
-                    content_text = alt_text # Default
-                    try:
-                        caption_element = post_page.locator('h1').first
-                        await caption_element.wait_for(state="visible", timeout=10000)
-                        content_text = await caption_element.text_content()
-                    except Exception:
-                        logging.info("  > No h1 caption found, using grid alt_text.")
-
-                    next_button_selector = 'button._afxw._al46._al47'
-                    is_carousel = False
-                    try:
-                        await post_page.locator(next_button_selector).wait_for(state="visible", timeout=2000)
-                        is_carousel = True
-                    except Exception:
-                        is_carousel = False
-                    
-                    if is_carousel or not media_url:
-                        if is_carousel:
-                            logging.info("  > Carousel post detected. Using manual scrape for images/fallback...")
-                        else:
-                            logging.warning("  > Network intercept failed for reel. Falling back to thumbnail...")
-                        try:
-                            # Inside modal, the selector is different
-                            img_elements = await post_page.locator('img[style*="object-fit"]').all()
-                            for el in img_elements:
-                                if await el.is_visible():
-                                    img_src = await el.get_attribute("src")
-                                    if img_src and "scontent" in img_src: 
-                                        media_url = img_src
-                                        break
-                            if not media_url: raise Exception("No visible image")
-                        except Exception as e:
-                            logging.warning(f"  > Fallback scrape failed for {post_id}: {e}")
-                    else:
-                        logging.info("  > Network intercept successful.")
-                        content_type = content_type_from_intercept
-
-                    if not media_url:
-                        logging.warning(f"  > No media_url found for {post_id}. Skipping save.")
-                        await post_page.close()
-                        continue
+                        logging.info(f"  > Downloading video for {post_id}...")
+                        video_response = await client.get(video_url, timeout=30.0)
+                        video_response.raise_for_status() # Fail on 4xx/5xx
                         
-                    database.save_content(
-                        target_id=target_id,
-                        platform='instagram',
-                        post_id=post_id,
-                        content_type=content_type, 
-                        content_text=content_text.strip(),
-                        media_url=media_url,
-                        post_url=post_url,
-                        author_username=username
-                    )
-                    logging.info(f"[Collector] Saved new {content_type}: {post_id} for {username}")
-                    saved_count += 1
-                    
-                    # Close the tab
-                    await post_page.close()
-                    
-                except Exception as e:
-                    try:
-                        if post_page: await post_page.close()
-                        page.remove_listener("request", network_handler)
-                    except Exception:
-                        pass 
-                    logging.error(f"  > Failed to scrape post page {post_url}: {e}")
-                    await page.screenshot(path=f"debug_post_failure_{post_id}.png")
+                        video_bytes = video_response.content
+                        content_type = post_data.get("product_type", "reel") # e.g., "clips"
+                        
+                        local_path = MEDIA_DIR / f"{post_id}.mp4"
+                        with open(local_path, "wb") as f:
+                            f.write(video_bytes)
+                        logging.info(f"  > Video saved to: {local_path}")
+                        
+                        # Save to DB
+                        database.save_content(
+                            target_id=target_id,
+                            platform='instagram',
+                            post_id=post_id,
+                            content_type=content_type, 
+                            content_text=caption.strip(),
+                            media_url=str(local_path), # <-- Save the LOCAL path
+                            post_url=post_url,
+                            author_username=username
+                        )
+                        logging.info(f"[Collector] Saved new {content_type}: {post_id} for {username}")
+                        saved_count += 1
+                        
+                    except Exception as e:
+                        logging.error(f"  > Failed to download or save video {post_id}: {e}")
+                        await page.screenshot(path=f"debug_video_download_fail_{post_id}.png")
 
-            logging.info(f"Smart Scrape complete for {username}. Saved {saved_count} new items.")
+            logging.info(f"GraphQL Scrape complete for {username}. Saved {saved_count} new items.")
+        
         else:
             logging.info("[CLI] Skipping post scraping.")
 
-    # --- NO BROWSER CLEANUP - Main() will handle it ---
+        # --- 5. CLEANUP ---
+        await context.close()
+        await browser.close()
+        logging.info("Browser closed. Task finished.")
 
 
+
+# This block allows us to run and test this file directly
 async def main():
     # --- NEW: CLI Argument Parser ---
     parser = argparse.ArgumentParser(description="NFPInfluencers Instagram Scraper")
@@ -393,7 +432,7 @@ async def main():
 
     logging.info("--- [DIRECT TEST MODE] ---")
     
-    if not config.validate_config(required_keys=["IG_USERNAME", "IG_PASSWORD"]):
+    if not config.validate_config(required_keys=["IG_USERNAME", "IG_PASSWORD", "IG_APP_ID"]):
         logging.error("CRITICAL: IG_USERNAME and IG_PASSWORD not in .env. Exiting.")
         exit(1)
 
