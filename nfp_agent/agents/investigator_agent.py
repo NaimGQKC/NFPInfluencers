@@ -10,7 +10,6 @@ import google.generativeai as genai # NEW: For transcription
 from ..core import config, database 
 
 # --- LangChain & Gemini Imports ---
-# We still use LangChain for the *analysis* part
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -20,7 +19,10 @@ YAML_CONFIG_PATH = Path(__file__).parent / "legal_provisions.yaml"
 
 # --- Media Download Config ---
 MEDIA_DIR = config.BASE_DIR / "data" / "media"
+# --- THIS IS THE OUTPUT DIR FOR ANALYSIS FILES ---
+INVESTIGATION_DIR = config.BASE_DIR / "data" / "investigations"
 os.makedirs(MEDIA_DIR, exist_ok=True)
+os.makedirs(INVESTIGATION_DIR, exist_ok=True)
 
 # --- NEW: Configure the Gemini API client ---
 if config.GEMINI_API_KEY:
@@ -39,7 +41,6 @@ def _load_yaml_config():
     except yaml.YAMLError as exc:
         logging.error(f"FATAL: Error parsing YAML file: {exc}")
         sys.exit(1)
-
 
 def _get_content_for_target(target_id: int) -> list:
     """
@@ -65,6 +66,24 @@ def _get_content_for_target(target_id: int) -> list:
         return []
     finally:
         conn.close()
+        
+# --- NEW MODULAR FUNCTION ---
+def get_content_by_post_id(post_id: str) -> dict:
+    """
+    Fetches a single piece of content by its post_id.
+    """
+    sql = "SELECT * FROM public_content WHERE post_id = ? LIMIT 1"
+    conn = database.get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql, (post_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        logging.error(f"Error getting content for post_id {post_id}: {e}")
+        return None
+    finally:
+        conn.close()
 
 def _load_rag_context(config_data: dict) -> str:
     """
@@ -73,43 +92,31 @@ def _load_rag_context(config_data: dict) -> str:
     logging.info("Loading REAL legal context (RAG) from YAML...")
     return config_data['legal_context']
 
-# --- NEW: Real Transcription Function (using Gemini) ---
-def _transcribe_video_real(post_id: str, media_url: str) -> str:
+# --- REFACTORED: NO LONGER USES HTTPO ---
+def _transcribe_video_real(post_id: str, media_path: str) -> str:
     """
-    Downloads a video and transcribes it using the Gemini API.
+    Reads a local video file and transcribes it using the Gemini API.
     Returns the transcribed text.
     """
     if not genai:
         logging.error("Gemini API not configured. Skipping transcription.")
         return "[Transcription Failed: API not configured]"
         
-    logging.info(f"Starting transcription for {post_id}...")
+    logging.info(f"Starting transcription for {post_id} from local file: {media_path}")
     
-    # We use .mp4 extension for all videos, regardless of original type
-    video_path = MEDIA_DIR / f"{post_id}.mp4" 
+    video_path = Path(media_path)
     
     try:
-        # --- 1. Download Video ---
-        if not os.path.exists(video_path):
-            logging.info(f"  > Downloading video: {media_url}")
-            # Use httpx with follow_redirects for CDN links
-            with httpx.stream("GET", media_url, timeout=30.0, follow_redirects=True) as response:
-                response.raise_for_status() 
-                with open(video_path, "wb") as f:
-                    for chunk in response.iter_bytes():
-                        f.write(chunk)
-            logging.info(f"  > Video saved to: {video_path}")
-        else:
-            logging.info(f"  > Video already downloaded: {video_path}")
+        if not video_path.exists():
+            logging.error(f"  > File not found: {video_path}")
+            return "[Transcription Failed: File not found]"
 
-        # --- 2. Upload and Transcribe with Gemini ---
-        logging.info("  > Uploading video to Gemini for transcription...")
+        # --- Upload and Transcribe with Gemini ---
+        logging.info(f"  > Uploading {video_path} to Gemini for transcription...")
         
-        # Uploads the file to the Gemini API (temporary file)
         video_file = genai.upload_file(path=video_path, display_name=post_id)
         logging.info("  > Upload complete. Waiting for transcription...")
 
-        # Transcribe with Gemini 2.5 Flash
         model = genai.GenerativeModel(model_name="gemini-2.5-flash")
         
         response = model.generate_content([
@@ -117,7 +124,6 @@ def _transcribe_video_real(post_id: str, media_url: str) -> str:
             video_file
         ])
         
-        # Clean up the temporary file from Google's side immediately
         genai.delete_file(video_file.name)
 
         transcript = response.text.strip()
@@ -127,48 +133,33 @@ def _transcribe_video_real(post_id: str, media_url: str) -> str:
         logging.info(f"  > Transcription complete for {post_id}.")
         return transcript
 
-    except httpx.RequestError as e:
-        logging.error(f"  > Download failed for {post_id}: {e}")
-        return "[Transcription Failed: Download error]"
     except Exception as e:
         logging.error(f"  > An unknown transcription error occurred for {post_id}: {e}")
         return f"[Transcription Failed: {e}]"
 
-def run_investigation(target_username: str):
+# --- NEW MODULAR FUNCTION ---
+def analyze_content_item(content: dict, llm: ChatGoogleGenerativeAI, legal_context: str, author_username: str):
     """
-    The main entry point for the Investigator Agent.
+    Runs the analysis for a single piece of content.
+    This is the core logic moved from run_investigation.
     """
-    logging.info(f"--- Starting Investigation for: {target_username} ---")
+    post_id = content['post_id']
+    logging.info(f"Investigating post: {post_id} ({content['post_url']}) (Type: {content['content_type']})")
     
-    # 1. Validate Config & Load YAML
-    if not config.GEMINI_API_KEY:
-        logging.error("GEMINI_API_KEY not configured. Exiting.")
-        return
-        
-    config_data = _load_yaml_config() 
+    caption = content['content_text']
+    transcript = "[Media is an image, no audio.]" # Default
 
-    # 2. Initialize LangChain LLM (for RAG analysis)
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash", 
-        temperature=0.1,
-        google_api_key=config.GEMINI_API_KEY
-    )
+    content_type = content['content_type']
+    media_path = content['media_url'] # This is the local file path
+    
+    # --- TRANSCRIPTION LOGIC ---
+    if content_type == 'story_video' or (media_path and '.mp4' in media_path):
+        logging.info("  > Video media detected. Attempting transcription...")
+        transcript = _transcribe_video_real(post_id, media_path)
+    else:
+        logging.info("  > No video media detected. Skipping transcription.")
 
-    # 3. Load RAG context (our legal documents)
-    legal_context = _load_rag_context(config_data)
-
-    # 4. Get Target and Content from DB
-    target = database.get_target_by_name(target_username)
-    if not target:
-        logging.error(f"No target found with username: {target_username}")
-        return
-        
-    content_list = _get_content_for_target(target['id'])
-    if not content_list:
-        logging.info("No content to investigate.")
-        return
-
-    # 5. Define the LangChain RAG Prompt
+    # --- RAG ANALYSIS ---
     prompt_template = """
     ROLE: You are a senior compliance analyst for the Ontario Securities Commission (OSC)
     and Competition Bureau of Canada. Your task is to identify specific,
@@ -201,53 +192,66 @@ def run_investigation(target_username: str):
         input_variables=["context", "transcript", "caption"],
         template=prompt_template
     )
-
-    # 6. Create the LangChain "Chain"
     chain = prompt | llm | StrOutputParser()
 
-    # 7. Iterate, Transcribe, and Analyze
+    try:
+        result = chain.invoke({
+            "context": legal_context,
+            "transcript": transcript,
+            "caption": caption if caption else "[No caption]"
+        })
+        
+        # --- SAVE ANALYSIS FILE ---
+        output_dir = INVESTIGATION_DIR / author_username
+        os.makedirs(output_dir, exist_ok=True)
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = output_dir / f"analysis_{post_id}_{timestamp}.txt"
+        
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(result)
+        logging.info(f"  > Analysis saved to: {output_file}")
+        return output_file
+
+    except Exception as e:
+        logging.error(f"  > Failed to analyze post {post_id}: {e}")
+        return None
+
+
+# --- REFACTORED: This is the original CLI function ---
+def run_investigation_for_target(target_username: str):
+    """
+    The main entry point for the Investigator Agent CLI.
+    Analyzes ALL content for a given target.
+    """
+    logging.info(f"--- Starting Investigation for: {target_username} ---")
+    
+    if not config.GEMINI_API_KEY:
+        logging.error("GEMINI_API_KEY not configured. Exiting.")
+        return
+        
+    config_data = _load_yaml_config()
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash", 
+        temperature=0.1,
+        google_api_key=config.GEMINI_API_KEY
+    )
+    legal_context = _load_rag_context(config_data)
+
+    target = database.get_target_by_name(target_username)
+    if not target:
+        logging.error(f"No target found with username: {target_username}")
+        return
+        
+    content_list = _get_content_for_target(target['id'])
+    if not content_list:
+        logging.info("No content to investigate.")
+        return
+
     logging.info(f"--- Analyzing {len(content_list)} pieces of content ---")
     
-    output_dir = config.BASE_DIR / "data" / "investigations" / target_username
-    os.makedirs(output_dir, exist_ok=True)
-    logging.info(f"Output folder created at: {output_dir}")
-
     for content in content_list:
-        post_id = content['post_id']
-        logging.info(f"Investigating post: {post_id} ({content['post_url']}) (Type: {content['content_type']})")
-        
-        caption = content['content_text']
-        transcript = "[Media is an image, no audio.]" # Default
-
-        content_type = content['content_type']
-        media_url = content['media_url']
-        
-        # --- NEW TRANSCRIPTION LOGIC ---
-        if content_type == 'story_video' or (media_url and '.mp4' in media_url):
-            logging.info("  > Video media detected. Attempting transcription...")
-            # This now calls the Gemini API transcribe function
-            transcript = _transcribe_video_real(post_id, media_url)
-        else:
-            logging.info("  > No video media detected. Skipping transcription.")
-        # --- END NEW LOGIC ---
-
-        # Run the RAG analysis chain
-        try:
-            result = chain.invoke({
-                "context": legal_context,
-                "transcript": transcript,
-                "caption": caption if caption else "[No caption]"
-            })
-            
-            timestamp = datetime.datetime.now().strftime("%Y%M%d_%H%M%S")
-            output_file = output_dir / f"analysis_{post_id}_{timestamp}.txt"
-            
-            with open(output_file, "w", encoding="utf-8") as f:
-                f.write(result)
-            logging.info(f"  > Analysis saved to: {output_file}")
-
-        except Exception as e:
-            logging.error(f"  > Failed to analyze post {post_id}: {e}")
+        analyze_content_item(content, llm, legal_context, target_username)
 
     logging.info(f"--- Investigation complete for: {target_username} ---")
 
@@ -257,7 +261,8 @@ if __name__ == "__main__":
     
     if len(sys.argv) > 1:
         target_username = sys.argv[1]
-        run_investigation(target_username)
+        # --- CLI now calls the refactored function ---
+        run_investigation_for_target(target_username)
     else:
         print("Please provide a target_username to investigate.")
         print("Usage: python -m nfp_agent.agents.investigator_agent [username]")
