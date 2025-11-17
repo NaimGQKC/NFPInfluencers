@@ -33,7 +33,7 @@ async def run_single_job(username: str):
         return
 
     # 2. Get Target from DB
-    target = database.get_target_by_name(username)
+    target = get_target_by_name(username)
     if not target:
         log.error(f"[RUN NOW] Target '{username}' not found in DB. Did frontend save it?")
         return
@@ -47,7 +47,7 @@ async def run_single_job(username: str):
     log.info(f"[RUN NOW] Collection for {username} complete. Starting investigation...")
     
     # Get *only* the new stories for this target
-    db = database.get_db_connection()
+    db = get_db_connection()
     response = db.table('stories').select('*, targets!inner(username)') \
         .eq('media_type', 'video') \
         .is_('full_analysis', 'null') \

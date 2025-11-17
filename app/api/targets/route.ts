@@ -1,6 +1,18 @@
+// app/api/targets/route.ts
+
 import { NextRequest, NextResponse } from 'next/server';
-import { supabase, generateDossierId, normalizeUsername } from '@/lib/supabase';
+// Import createClient directly
+import { createClient } from '@supabase/supabase-js';
+// We still need these helpers
+import { generateDossierId, normalizeUsername } from '@/lib/supabase';
 import { CreateTargetRequest, CreateTargetResponse } from '@/types/dossier';
+
+// Create a new, server-side Supabase client
+// Note: We use process.env.SUPABASE_SERVICE_ROLE_KEY, NOT the NEXT_PUBLIC_ one
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
 
 export async function POST(request: NextRequest) {
   try {
@@ -22,6 +34,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // ... (The rest of your function is perfectly fine!)
     const { data: existing } = await supabase
       .from('targets')
       .select('dossier_id')

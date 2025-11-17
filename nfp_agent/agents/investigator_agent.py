@@ -6,8 +6,9 @@ import datetime
 from pathlib import Path 
 import yaml 
 import httpx
-import google.generativeai as genai
 from ..core import config, database 
+import google.genai as genai
+from google.genai import types
 
 # --- LangChain & Gemini Imports ---
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -22,8 +23,9 @@ YAML_CONFIG_PATH = Path(__file__).parent / "legal_provisions.yaml"
 # os.makedirs(INVESTIGATION_DIR, exist_ok=True)
 
 if config.GEMINI_API_KEY:
-    genai.configure(api_key=config.GEMINI_API_KEY)
+    client = genai.Client(api_key=config.GEMINI_API_KEY)
 else:
+    client = None
     logging.warning("GEMINI_API_KEY not found. Transcription and analysis will fail.")
 
 def _load_yaml_config():
@@ -67,7 +69,7 @@ def _transcribe_video_from_url(story_id: str, media_url: str) -> str:
     """
     Downloads a video *in-memory* from a URL and transcribes it.
     """
-    if not genai:
+    if not client:  # Change from 'genai' to 'client'
         logging.error("Gemini API not configured. Skipping transcription.")
         return "[Transcription Failed: API not configured]"
         
@@ -75,8 +77,7 @@ def _transcribe_video_from_url(story_id: str, media_url: str) -> str:
     
     temp_video_path = None
     try:
-        # --- 1. Download Video to a temporary file ---
-        # We must download it, as Gemini can't transcribe from a URL directly
+        # Download video
         temp_video_path = Path(f"temp_video_{story_id}.mp4")
         
         with httpx.stream("GET", media_url, timeout=30.0, follow_redirects=True) as response:
@@ -86,21 +87,25 @@ def _transcribe_video_from_url(story_id: str, media_url: str) -> str:
                     f.write(chunk)
         
         logging.info(f"  > Temp video saved to: {temp_video_path}")
-
-        # --- 2. Upload and Transcribe with Gemini ---
-        logging.info(f"  > Uploading {temp_video_path} to Gemini for transcription...")
+        logging.info(f"  > Uploading to Gemini for transcription...")
         
-        video_file = genai.upload_file(path=temp_video_path, display_name=story_id)
+        # Upload file using the NEW SDK
+        upload_response = client.files.upload(file=str(temp_video_path))
+        file_uri = upload_response.uri
+        
         logging.info("  > Upload complete. Waiting for transcription...")
 
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+        # Generate content using the NEW SDK
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',  # or 'gemini-1.5-flash'
+            contents=[
+                "Transcribe the audio from this video. Only return the full, raw transcript and nothing else.",
+                genai.types.Part.from_uri(file_uri=file_uri, mime_type="video/mp4")
+            ]
+        )
         
-        response = model.generate_content([
-            "Transcribe the audio from this video. Only return the full, raw transcript and nothing else.",
-            video_file
-        ])
-        
-        genai.delete_file(video_file.name)
+        # Clean up the file
+        client.files.delete(name=upload_response.name)
 
         transcript = response.text.strip()
         if not transcript:
@@ -116,7 +121,6 @@ def _transcribe_video_from_url(story_id: str, media_url: str) -> str:
         logging.error(f"  > An unknown transcription error occurred for {story_id}: {e}")
         return f"[Transcription Failed: {e}]"
     finally:
-        # --- 3. Clean up the temporary file ---
         if temp_video_path and temp_video_path.exists():
             os.remove(temp_video_path)
             logging.info(f"  > Cleaned up temp file: {temp_video_path}")
@@ -209,7 +213,7 @@ def run_investigation_for_target(target_username: str):
         
     config_data = _load_yaml_config()
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash", 
+        model="gemini-2.5-flash",  # or "gemini-1.5-flash"
         temperature=0.1,
         google_api_key=config.GEMINI_API_KEY
     )
