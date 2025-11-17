@@ -4,6 +4,7 @@ import os
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from langchain_google_genai import ChatGoogleGenerativeAI
+import datetime
 
 from ..core import database, config
 from ..tools import ig_scraper
@@ -26,10 +27,10 @@ if config.GEMINI_API_KEY:
 else:
     log.error("GEMINI_API_KEY not found. Investigator job will not run.")
 
+# --- JOB 1 (Scheduled) ---
 async def collector_job():
     """
     Job 1: Scrape all targets in the database.
-    Runs the full API-based scrape for every target.
     """
     log.info("--- [COLLECTOR JOB] Starting run... ---")
     targets = database.list_targets()
@@ -39,7 +40,6 @@ async def collector_job():
 
     log.info(f"[COLLECTOR JOB] Found {len(targets)} targets to scrape.")
     
-    # We must ensure config is valid for the scraper
     required_keys = ["IG_USERNAME", "IG_PASSWORD", "IG_APP_ID"]
     if not config.validate_config(required_keys=required_keys):
         log.error("[COLLECTOR JOB] Invalid IG config. Aborting run.")
@@ -47,85 +47,79 @@ async def collector_job():
 
     for target in targets:
         username = target['username']
-        target_id = target['id']
-        log.info(f"[COLLECTOR JOB] Scraping target: {username}")
-        try:
-            # Call the imported scraper function
-            await ig_scraper.scrape_instagram_target(
-                target_id=target_id, 
-                username=username,
-                skip_stories=False, # We want stories
-                skip_posts=True     # --- MVP SCOPE: Hardcode to True ---
-            )
-            log.info(f"[COLLECTOR JOB] Finished scraping {username}.")
-        except Exception as e:
-            log.error(f"[COLLECTOR JOB] Failed to scrape {username}: {e}", exc_info=True)
-            # Continue to the next target even if one fails
+        target_id_uuid = target['id'] # This is the UUID from Supabase
+        await run_collector_for_target(target_id_uuid, username)
             
     log.info("--- [COLLECTOR JOB] Run complete. ---")
 
+# --- NEW: ON-DEMAND COLLECTOR ---
+async def run_collector_for_target(target_id_uuid: str, username: str):
+    """
+    Runs the full collection logic for a *single* target.
+    """
+    log.info(f"[COLLECTOR] Scraping target: {username}")
+    try:
+        await ig_scraper.scrape_instagram_target(
+            target_id_uuid=target_id_uuid, 
+            username=username,
+            skip_stories=False,
+            skip_posts=True     # MVP SCOPE: Hardcode to True
+        )
+        log.info(f"[COLLECTOR] Finished scraping {username}.")
+    except Exception as e:
+        log.error(f"[COLLECTOR] Failed to scrape {username}: {e}", exc_info=True)
+# --- END NEW ---
+
+# --- JOB 2 (Scheduled) ---
 async def investigator_job():
     """
     Job 2: Analyze all un-analyzed content.
-    Finds content in the DB that doesn't have a matching analysis file.
     """
     log.info("--- [INVESTIGATOR JOB] Starting run... ---")
     if not llm or not legal_context:
         log.error("[INVESTIGATOR JOB] LLM or legal context not loaded. Skipping.")
         return
 
-    conn = database.get_db_connection()
     try:
-        # --- MVP SCOPE: Only look for story_video ---
-        sql = """
-        SELECT pc.*, t.username 
-        FROM public_content pc
-        JOIN targets t ON pc.target_id = t.id
-        WHERE pc.content_type = 'story_video'
-        """
-        # --- END MVP SCOPE ---
-        
-        cursor = conn.cursor()
-        cursor.execute(sql)
-        content_rows = cursor.fetchall()
+        # --- NEW: Use new helper function ---
+        content_rows = investigator_agent._get_unanalyzed_stories()
         
         if not content_rows:
-            log.info("[INVESTIGATOR JOB] No video content found to analyze.")
+            log.info("[INVESTIGATOR JOB] No new video content found to analyze.")
             return
-
-        log.info(f"[INVESTIGATOR JOB] Found {len(content_rows)} total video items. Checking for analysis files...")
         
+        log.info(f"[INVESTIGATOR JOB] Found {len(content_rows)} items to analyze.")
         analyzed_count = 0
-        for row in content_rows:
-            content = dict(row)
-            post_id = content['post_id']
-            author_username = content['username']
-            
-            # Check if an analysis file *already exists*
-            analysis_dir = investigator_agent.INVESTIGATION_DIR / author_username
-            # Ensure analysis_dir exists before listdir
-            os.makedirs(analysis_dir, exist_ok=True) 
-            
-            analysis_files = os.listdir(analysis_dir)
-            if any(f.startswith(f"analysis_{post_id}") for f in analysis_files if os.path.isfile(os.path.join(analysis_dir, f))):
-                log.info(f"  > Skipping {post_id} (already analyzed).")
-                continue
-                
-            # --- Not analyzed, so run the analysis ---
-            log.info(f"  > Analyzing new item: {post_id} from {author_username}")
-            try:
-                investigator_agent.analyze_content_item(content, llm, legal_context, author_username)
-                analyzed_count += 1
-            except Exception as e:
-                log.error(f"  > Failed to analyze {post_id}: {e}", exc_info=True)
+        for story in content_rows:
+            # --- MODIFIED: Call new modular function ---
+            await run_investigator_for_story(story)
+            analyzed_count += 1
+            # --- END MODIFIED ---
 
         log.info(f"--- [INVESTIGATOR JOB] Run complete. Analyzed {analyzed_count} new items. ---")
 
     except Exception as e:
         log.error(f"[INVESTIGATOR JOB] Database error: {e}", exc_info=True)
     finally:
-        if conn:
-            conn.close()
+        pass # No conn.close() needed
+
+# --- NEW: ON-DEMAND INVESTIGATOR ---
+async def run_investigator_for_story(story: dict):
+    """
+    Runs the full investigation logic for a *single* story.
+    """
+    if not llm or not legal_context:
+        log.error("[INVESTIGATOR] LLM or legal context not loaded. Skipping.")
+        return
+        
+    log.info(f"  > Analyzing new item: {story['story_id']} from {story['targets']['username']}")
+    try:
+        # This function will now write the analysis to Supabase
+        investigator_agent.analyze_content_item(story, llm, legal_context)
+    except Exception as e:
+        log.error(f"  > Failed to analyze {story['story_id']}: {e}", exc_info=True)
+# --- END NEW ---
+
 
 def start_daemon():
     """
@@ -134,7 +128,6 @@ def start_daemon():
     log.info("Starting NFPInlfuencers Surveillance Daemon...")
     scheduler = AsyncIOScheduler()
     
-    # Add Job 1: Run the collector every 6 hours
     scheduler.add_job(
         collector_job,
         trigger=IntervalTrigger(hours=6),
@@ -142,26 +135,23 @@ def start_daemon():
         replace_existing=True
     )
     
-    # Add Job 2: Run the investigator every 6 hours, 5 mins after the collector
     scheduler.add_job(
         investigator_job,
-        trigger=IntervalTrigger(hours=6, start_date_offset_minutes=5),
+        # Run 5 minutes after the collector
+        trigger=IntervalTrigger(hours=6, start_date=datetime.datetime.now() + datetime.timedelta(minutes=5)),
         id="investigator_job",
         replace_existing=True
     )
     
-    # Run the jobs immediately on startup for testing
     log.info("Adding initial startup jobs...")
     scheduler.add_job(collector_job, id="initial_collector_run")
-    # Small delay for collector to finish before investigator starts
-    scheduler.add_job(investigator_job, id="initial_investigator_run", run_date_delay=30) 
+    # Run investigator 30 seconds after collector starts
+    scheduler.add_job(investigator_job, id="initial_investigator_run", run_date=datetime.datetime.now() + datetime.timedelta(seconds=30))
     
     scheduler.start()
     log.info("Daemon started. Press Ctrl+C to exit.")
     
-    # Keep the script running
     try:
-        # This is the correct way to keep an asyncio event loop running
         asyncio.get_event_loop().run_forever()
     except (KeyboardInterrupt, SystemExit):
         log.info("Daemon shutting down...")

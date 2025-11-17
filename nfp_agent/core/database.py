@@ -1,187 +1,180 @@
-import sqlite3
-import os
-import datetime
 import logging
-from . import config # Use relative import
+from supabase import create_client, Client
+from . import config
+import secrets
+import string
+import datetime
+
+# --- NEW: Initialize Supabase Client ---
+supabase: Client = None
+if config.SUPABASE_URL and config.SUPABASE_KEY:
+    supabase = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+else:
+    logging.error("FATAL: Supabase URL or Service Role Key not configured.")
+# --- END NEW ---
 
 def get_db_connection():
     """
-    Establishes a connection to the SQLite database.
-    Creates the 'data' directory if it doesn't exist.
-    Returns a connection object.
+    Returns the initialized Supabase client.
+    (This replaces the old sqlite3 get_db_connection)
     """
-    # Ensure the data directory exists
-    db_dir = os.path.dirname(config.DB_PATH_STR)
-    os.makedirs(db_dir, exist_ok=True)
-    
-    conn = sqlite3.connect(config.DB_PATH_STR)
-    # Return rows as dictionaries
-    conn.row_factory = sqlite3.Row 
-    return conn
+    if not supabase:
+        raise Exception("Supabase client is not initialized.")
+    return supabase
 
 def init_db():
     """
-    Initializes the database and creates the necessary tables 
-    if they don't exist.
+    Supabase manages the schema. This function just confirms connection.
+    (This replaces the old sqlite3 init_db)
     """
-    logging.info("Initializing database...")
-    
-    # SQL for creating the targets table
-    create_targets_table = """
-    CREATE TABLE IF NOT EXISTS targets (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL,
-        platform TEXT NOT NULL,
-        date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(username, platform)
-    );
-    """
-    
-    # SQL for creating the public_content table
-    # This schema matches what ig_scraper.py provides
-    create_public_content_table = """
-    CREATE TABLE IF NOT EXISTS public_content (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        target_id INTEGER NOT NULL,
-        platform TEXT NOT NULL,
-        post_id TEXT NOT NULL,
-        content_type TEXT NOT NULL, -- 'post', 'reel', 'story', 'comment'
-        content_text TEXT,
-        media_url TEXT,
-        post_url TEXT,
-        author_username TEXT,
-        scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (target_id) REFERENCES targets (id),
-        UNIQUE(post_id, platform)
-    );
-    """
-
-    conn = get_db_connection()
+    logging.info("Connecting to Supabase to check tables...")
     try:
-        cursor = conn.cursor()
-        cursor.execute(create_targets_table)
-        cursor.execute(create_public_content_table)
-        conn.commit()
-        logging.info("Database tables checked/created successfully.")
+        db = get_db_connection()
+        # Test connection by listing tables
+        db.table('targets').select('id').limit(1).execute()
+        logging.info("Database connection successful. 'targets' table is accessible.")
     except Exception as e:
-        logging.error(f"Error initializing database: {e}")
-    finally:
-        conn.close()
+        logging.error(f"Error connecting to Supabase or finding tables: {e}")
+        logging.error("Please ensure your Supabase schema is migrated (see 'project/supabase/migrations')")
 
-def add_target(username: str, platform: str):
+def generate_dossier_id():
     """
-    Adds a new influencer to the targets table.
+    Generates a secure, random 12-character ID for the dossier URL.
+    Matches the frontend utility function [cite: `project/lib/supabase.ts`].
     """
-    sql = "INSERT INTO targets (username, platform) VALUES (?, ?)"
+    chars = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(chars) for _ in range(12))
+
+def add_target(username: str, platform: str = "instagram") -> dict:
+    """
+    Adds a new influencer to the 'targets' table.
+    Matches the frontend API logic [cite: `project/app/api/targets/route.ts`].
+    Returns the new target object or existing target.
+    (This replaces the old sqlite3 add_target)
+    """
+    if platform != "instagram":
+        logging.warning("Only 'instagram' platform is supported for now.")
+        return None
+
+    db = get_db_connection()
     
-    conn = get_db_connection()
+    # Normalize username
+    clean_username = username.strip().lower().replace('@', '')
+    
     try:
-        cursor = conn.cursor()
-        cursor.execute(sql, (username, platform))
-        conn.commit()
-        logging.info(f"Successfully added target: {username} on {platform}")
-    except sqlite3.IntegrityError:
-        # This occurs if the UNIQUE(username, platform) constraint fails
-        logging.warning(f"Error: Target '{username}' on '{platform}' already exists.")
+        # Check if target already exists
+        existing = db.table('targets').select('id, dossier_id, username').eq('username', clean_username).maybe_single().execute()
+        
+        if existing.data:
+            logging.warning(f"Target '{clean_username}' already exists. Returning existing dossier.")
+            return existing.data
+
+        # If not, create new target with a unique dossier_id
+        dossier_id = generate_dossier_id()
+        
+        new_target = db.table('targets').insert({
+            'username': clean_username,
+            'dossier_id': dossier_id,
+            'last_updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat()
+        }).select('*').single().execute()
+
+        logging.info(f"Successfully added target: {clean_username} (Dossier ID: {dossier_id})")
+        return new_target.data
+    
     except Exception as e:
-        logging.error(f"Error adding target {username}: {e}")
-    finally:
-        conn.close()
+        logging.error(f"Error adding target {clean_username}: {e}")
+        return None
 
 def list_targets() -> list:
     """
-    Fetches all targets from the database, ordered by when they were added.
-    Returns a list of dictionary-like Row objects.
+    Fetches all targets from the Supabase 'targets' table.
+    (This replaces the old sqlite3 list_targets)
     """
-    sql = "SELECT * FROM targets ORDER BY date_added DESC"
-    
-    conn = get_db_connection()
+    db = get_db_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(sql)
-        targets = cursor.fetchall()
-        # Convert Row objects to plain dicts for easier use
-        return [dict(row) for row in targets]
+        response = db.table('targets').select('*').order('created_at', desc=True).execute()
+        return response.data
     except Exception as e:
         logging.error(f"Error listing targets: {e}")
         return []
-    finally:
-        conn.close()
 
 def get_target_by_name(username: str) -> dict:
     """
     Fetches a single target by their username.
-    Returns a dictionary-like Row object or None if not found.
+    (This replaces the old sqlite3 get_target_by_name)
     """
-    sql = "SELECT * FROM targets WHERE username = ?"
-    
-    conn = get_db_connection()
+    db = get_db_connection()
+    clean_username = username.strip().lower().replace('@', '')
     try:
-        cursor = conn.cursor()
-        cursor.execute(sql, (username,))
-        target = cursor.fetchone()
-        return dict(target) if target else None
+        response = db.table('targets').select('*').eq('username', clean_username).maybe_single().execute()
+        return response.data
     except Exception as e:
-        logging.error(f"Error getting target {username}: {e}")
+        logging.error(f"Error getting target {clean_username}: {e}")
         return None
-    finally:
-        conn.close()
 
-def content_exists(post_id: str) -> bool:
+def content_exists(story_id: str) -> bool:
     """
-    Checks if a specific post_id is already in the public_content table.
-    Returns True if it exists, False otherwise.
+    Checks if a specific story_id is already in the 'stories' table.
+    (This replaces the old sqlite3 content_exists)
     """
-    sql = "SELECT 1 FROM public_content WHERE post_id = ? LIMIT 1"
-    
-    conn = get_db_connection()
+    db = get_db_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(sql, (post_id,))
-        exists = cursor.fetchone()
-        return bool(exists)
+        # Use 'story_id' column from your schema [cite: `project/supabase/migrations/20251116235429_create_leviproof_schema.sql`]
+        response = db.table('stories').select('id').eq('story_id', story_id).limit(1).execute()
+        return bool(response.data)
     except Exception as e:
-        logging.error(f"Error checking if content exists {post_id}: {e}")
-        return False # Default to False on error
-    finally:
-        conn.close()
+        logging.error(f"Error checking if content exists {story_id}: {e}")
+        return False
 
-def save_content(target_id: int, platform: str, post_id: str, 
-                 content_type: str, content_text: str, media_url: str, 
-                 post_url: str, author_username: str):
+def save_story(target_id_uuid: str, story_id: str, timestamp: str, media_type: str, media_url: str):
     """
-    Saves a single piece of scraped content to the public_content table.
+    Saves a single story to the 'stories' table.
+    Matches the Supabase schema [cite: `project/supabase/migrations/20251116235429_create_leviproof_schema.sql`].
+    (This replaces the old sqlite3 save_content)
     """
-    sql = """
-    INSERT INTO public_content 
-    (target_id, platform, post_id, content_type, content_text, media_url, post_url, author_username) 
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """
-    
-    conn = get_db_connection()
+    db = get_db_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(sql, (
-            target_id, 
-            platform, 
-            post_id, 
-            content_type, 
-            content_text, 
-            media_url, 
-            post_url, 
-            author_username
-        ))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        logging.warning(f"Content with post_id {post_id} already exists. Skipping save.")
+        db.table('stories').insert({
+            'target_id': target_id_uuid,
+            'story_id': story_id,
+            'timestamp': timestamp,
+            'media_type': media_type,
+            'media_url': media_url, # Save the public URL
+            'summary': None, # Will be filled by investigator
+            'full_analysis': None # Will be filled by investigator
+        }).execute()
+        
+        # Also update the parent target's last_updated_at
+        db.table('targets').update({
+            'last_updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat()
+        }).eq('id', target_id_uuid).execute()
+        
     except Exception as e:
-        logging.error(f"Error saving content {post_id}: {e}")
-    finally:
-        conn.close()
+        if "unique constraint" in str(e).lower():
+            logging.warning(f"Story with story_id {story_id} already exists. Skipping save.")
+        else:
+            logging.error(f"Error saving story {story_id}: {e}")
 
-if __name__ == "__main__":
-    # This allows you to run `python -m nfp_agent.core.database` to init the DB
-    logging.basicConfig(level=logging.INFO)
-    print("Initializing database from direct script run...")
-    init_db()
-    print("Database initialization complete.")
+def update_story_analysis(story_id: str, summary: str, full_analysis: str):
+    """
+    Updates a story with the AI-generated analysis.
+    (This is a new function for the investigator)
+    """
+    db = get_db_connection()
+    try:
+        db.table('stories').update({
+            'summary': summary,
+            'full_analysis': full_analysis
+        }).eq('story_id', story_id).execute()
+        
+        # Update the parent target's last_updated_at timestamp
+        # Find the target_id from the story
+        story = db.table('stories').select('target_id').eq('story_id', story_id).single().execute()
+        if story.data:
+            db.table('targets').update({
+                'last_updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }).eq('id', story.data['target_id']).execute()
+
+        logging.info(f"Successfully updated analysis for story {story_id}")
+    except Exception as e:
+        logging.error(f"Error updating analysis for story {story_id}: {e}")

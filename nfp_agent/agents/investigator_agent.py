@@ -5,8 +5,8 @@ import os
 import datetime
 from pathlib import Path 
 import yaml 
-import httpx # For downloading video
-import google.generativeai as genai # NEW: For transcription
+import httpx
+import google.generativeai as genai
 from ..core import config, database 
 
 # --- LangChain & Gemini Imports ---
@@ -17,14 +17,10 @@ from langchain_core.output_parsers import StrOutputParser
 # --- GLOBAL YAML CONFIG PATH ---
 YAML_CONFIG_PATH = Path(__file__).parent / "legal_provisions.yaml"
 
-# --- Media Download Config ---
-MEDIA_DIR = config.BASE_DIR / "data" / "media"
-# --- THIS IS THE OUTPUT DIR FOR ANALYSIS FILES ---
-INVESTIGATION_DIR = config.BASE_DIR / "data" / "investigations"
-os.makedirs(MEDIA_DIR, exist_ok=True)
-os.makedirs(INVESTIGATION_DIR, exist_ok=True)
+# --- DE-SCOPED: We no longer save analysis to local files ---
+# INVESTIGATION_DIR = config.BASE_DIR / "data" / "investigations"
+# os.makedirs(INVESTIGATION_DIR, exist_ok=True)
 
-# --- NEW: Configure the Gemini API client ---
 if config.GEMINI_API_KEY:
     genai.configure(api_key=config.GEMINI_API_KEY)
 else:
@@ -35,55 +31,30 @@ def _load_yaml_config():
     try:
         with open(YAML_CONFIG_PATH, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
-    except FileNotFoundError:
-        logging.error(f"FATAL: YAML config file not found at {YAML_CONFIG_PATH}")
-        sys.exit(1)
-    except yaml.YAMLError as exc:
-        logging.error(f"FATAL: Error parsing YAML file: {exc}")
+    except Exception as e:
+        logging.error(f"FATAL: Error loading YAML config: {e}")
         sys.exit(1)
 
-def _get_content_for_target(target_id: int) -> list:
+def _get_unanalyzed_stories() -> list:
     """
-    Helper function to query the database for all content
-    scraped from a specific target.
+    Helper function to query Supabase for video stories
+    that have not been analyzed yet.
     """
-    logging.info(f"Querying database for all content from target_id: {target_id}")
-    sql = "SELECT * FROM public_content WHERE target_id = ?"
-    
-    conn = database.get_db_connection()
+    logging.info("Querying database for unanalyzed stories...")
+    db = database.get_db_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(sql, (target_id,))
-        content_rows = cursor.fetchall()
-        if not content_rows:
-            logging.warning(f"No content found for target_id: {target_id}")
-            return []
+        # Find stories where full_analysis is null
+        # Joins with targets to get username
+        response = db.table('stories').select('*, targets(username)') \
+            .eq('media_type', 'video') \
+            .is_('full_analysis', 'null') \
+            .execute()
         
-        logging.info(f"Found {len(content_rows)} pieces of content.")
-        return [dict(row) for row in content_rows]
+        logging.info(f"Found {len(response.data)} new video items to analyze.")
+        return response.data
     except Exception as e:
-        logging.error(f"Error querying content for target {target_id}: {e}")
+        logging.error(f"Error querying for unanalyzed stories: {e}")
         return []
-    finally:
-        conn.close()
-        
-# --- NEW MODULAR FUNCTION ---
-def get_content_by_post_id(post_id: str) -> dict:
-    """
-    Fetches a single piece of content by its post_id.
-    """
-    sql = "SELECT * FROM public_content WHERE post_id = ? LIMIT 1"
-    conn = database.get_db_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(sql, (post_id,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
-    except Exception as e:
-        logging.error(f"Error getting content for post_id {post_id}: {e}")
-        return None
-    finally:
-        conn.close()
 
 def _load_rag_context(config_data: dict) -> str:
     """
@@ -92,29 +63,34 @@ def _load_rag_context(config_data: dict) -> str:
     logging.info("Loading REAL legal context (RAG) from YAML...")
     return config_data['legal_context']
 
-# --- REFACTORED: NO LONGER USES HTTPO ---
-def _transcribe_video_real(post_id: str, media_path: str) -> str:
+def _transcribe_video_from_url(story_id: str, media_url: str) -> str:
     """
-    Reads a local video file and transcribes it using the Gemini API.
-    Returns the transcribed text.
+    Downloads a video *in-memory* from a URL and transcribes it.
     """
     if not genai:
         logging.error("Gemini API not configured. Skipping transcription.")
         return "[Transcription Failed: API not configured]"
         
-    logging.info(f"Starting transcription for {post_id} from local file: {media_path}")
+    logging.info(f"Starting transcription for {story_id} from URL...")
     
-    video_path = Path(media_path)
-    
+    temp_video_path = None
     try:
-        if not video_path.exists():
-            logging.error(f"  > File not found: {video_path}")
-            return "[Transcription Failed: File not found]"
-
-        # --- Upload and Transcribe with Gemini ---
-        logging.info(f"  > Uploading {video_path} to Gemini for transcription...")
+        # --- 1. Download Video to a temporary file ---
+        # We must download it, as Gemini can't transcribe from a URL directly
+        temp_video_path = Path(f"temp_video_{story_id}.mp4")
         
-        video_file = genai.upload_file(path=video_path, display_name=post_id)
+        with httpx.stream("GET", media_url, timeout=30.0, follow_redirects=True) as response:
+            response.raise_for_status() 
+            with open(temp_video_path, "wb") as f:
+                for chunk in response.iter_bytes():
+                    f.write(chunk)
+        
+        logging.info(f"  > Temp video saved to: {temp_video_path}")
+
+        # --- 2. Upload and Transcribe with Gemini ---
+        logging.info(f"  > Uploading {temp_video_path} to Gemini for transcription...")
+        
+        video_file = genai.upload_file(path=temp_video_path, display_name=story_id)
         logging.info("  > Upload complete. Waiting for transcription...")
 
         model = genai.GenerativeModel(model_name="gemini-2.5-flash")
@@ -130,34 +106,40 @@ def _transcribe_video_real(post_id: str, media_path: str) -> str:
         if not transcript:
             transcript = "[Transcription empty or video has no audio]"
             
-        logging.info(f"  > Transcription complete for {post_id}.")
+        logging.info(f"  > Transcription complete for {story_id}.")
         return transcript
 
+    except httpx.RequestError as e:
+        logging.error(f"  > Download failed for {story_id}: {e}")
+        return "[Transcription Failed: Download error]"
     except Exception as e:
-        logging.error(f"  > An unknown transcription error occurred for {post_id}: {e}")
+        logging.error(f"  > An unknown transcription error occurred for {story_id}: {e}")
         return f"[Transcription Failed: {e}]"
+    finally:
+        # --- 3. Clean up the temporary file ---
+        if temp_video_path and temp_video_path.exists():
+            os.remove(temp_video_path)
+            logging.info(f"  > Cleaned up temp file: {temp_video_path}")
 
-# --- NEW MODULAR FUNCTION ---
-def analyze_content_item(content: dict, llm: ChatGoogleGenerativeAI, legal_context: str, author_username: str):
+def analyze_content_item(story: dict, llm: ChatGoogleGenerativeAI, legal_context: str):
     """
-    Runs the analysis for a single piece of content.
-    This is the core logic moved from run_investigation.
+    Runs the analysis for a single story item from Supabase.
     """
-    post_id = content['post_id']
-    logging.info(f"Investigating post: {post_id} ({content['post_url']}) (Type: {content['content_type']})")
+    story_id = story['story_id']
+    media_url = story['media_url']
     
-    caption = content['content_text']
+    logging.info(f"Investigating story: {story_id} (Type: {story['media_type']})")
+    
     transcript = "[Media is an image, no audio.]" # Default
 
-    content_type = content['content_type']
-    media_path = content['media_url'] # This is the local file path
-    
-    # --- TRANSCRIPTION LOGIC ---
-    if content_type == 'story_video' or (media_path and '.mp4' in media_path):
+    if story['media_type'] == 'video':
         logging.info("  > Video media detected. Attempting transcription...")
-        transcript = _transcribe_video_real(post_id, media_path)
+        transcript = _transcribe_video_from_url(story_id, media_url)
     else:
-        logging.info("  > No video media detected. Skipping transcription.")
+        # This function should only be called on videos, but as a safeguard
+        logging.info("  > Image media. Skipping transcription.")
+        # We still save "No violations found" to mark it as "processed"
+        transcript = "[Media is an image, no audio.]"
 
     # --- RAG ANALYSIS ---
     prompt_template = """
@@ -165,7 +147,7 @@ def analyze_content_item(content: dict, llm: ChatGoogleGenerativeAI, legal_conte
     and Competition Bureau of Canada. Your task is to identify specific,
     citable violations in promotional content.
 
-    TASK: Analyze the provided EVIDENCE (video transcript and caption)
+    TASK: Analyze the provided EVIDENCE (video transcript)
     against the provided LEGAL CONTEXT. Identify all violations.
     For each violation, you MUST:
     1. State the violation (e.g., "Misleading Performance Claim").
@@ -181,48 +163,43 @@ def analyze_content_item(content: dict, llm: ChatGoogleGenerativeAI, legal_conte
     EVIDENCE (Video Transcript):
     {transcript}
     ---
-    EVIDENCE (Original Post Caption):
-    {caption}
-    ---
 
     FINDINGS (Return ONLY your analysis):
     """
     
     prompt = PromptTemplate(
-        input_variables=["context", "transcript", "caption"],
+        input_variables=["context", "transcript"],
         template=prompt_template
     )
     chain = prompt | llm | StrOutputParser()
 
     try:
-        result = chain.invoke({
+        full_analysis = chain.invoke({
             "context": legal_context,
             "transcript": transcript,
-            "caption": caption if caption else "[No caption]"
         })
         
-        # --- SAVE ANALYSIS FILE ---
-        output_dir = INVESTIGATION_DIR / author_username
-        os.makedirs(output_dir, exist_ok=True)
+        # --- NEW: Generate a 1-sentence summary for the frontend ---
+        # This matches the 'summary' field in the 'stories' table
+        summary_prompt_text = f"Given the following analysis, write a 1-sentence summary of the finding (e.g., 'No violations found' or 'Found 2 violations of Misleading Performance Claims'). \n\nANALYSIS: {full_analysis}\n\nSUMMARY:"
+        summary_chain = PromptTemplate.from_template(summary_prompt_text) | llm | StrOutputParser()
+        summary = summary_chain.invoke({})
         
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = output_dir / f"analysis_{post_id}_{timestamp}.txt"
-        
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(result)
-        logging.info(f"  > Analysis saved to: {output_file}")
-        return output_file
+        # --- SAVE ANALYSIS TO SUPABASE ---
+        database.update_story_analysis(
+            story_id=story_id,
+            summary=summary,
+            full_analysis=full_analysis
+        )
 
     except Exception as e:
-        logging.error(f"  > Failed to analyze post {post_id}: {e}")
-        return None
-
+        logging.error(f"  > Failed to analyze post {story_id}: {e}")
 
 # --- REFACTORED: This is the original CLI function ---
 def run_investigation_for_target(target_username: str):
     """
     The main entry point for the Investigator Agent CLI.
-    Analyzes ALL content for a given target.
+    Analyzes ALL unanalyzed content for a given target.
     """
     logging.info(f"--- Starting Investigation for: {target_username} ---")
     
@@ -242,26 +219,32 @@ def run_investigation_for_target(target_username: str):
     if not target:
         logging.error(f"No target found with username: {target_username}")
         return
-        
-    content_list = _get_content_for_target(target['id'])
+    
+    # --- MODIFIED: Get unanalyzed stories for *this specific target* ---
+    db = database.get_db_connection()
+    response = db.table('stories').select('*, targets!inner(username)') \
+        .eq('media_type', 'video') \
+        .is_('full_analysis', 'null') \
+        .eq('targets.username', target_username) \
+        .execute()
+    
+    content_list = response.data
     if not content_list:
-        logging.info("No content to investigate.")
+        logging.info("No new content to investigate for this target.")
         return
 
     logging.info(f"--- Analyzing {len(content_list)} pieces of content ---")
     
-    for content in content_list:
-        analyze_content_item(content, llm, legal_context, target_username)
+    for story in content_list:
+        analyze_content_item(story, llm, legal_context)
 
     logging.info(f"--- Investigation complete for: {target_username} ---")
-
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     
     if len(sys.argv) > 1:
         target_username = sys.argv[1]
-        # --- CLI now calls the refactored function ---
         run_investigation_for_target(target_username)
     else:
         print("Please provide a target_username to investigate.")
