@@ -65,7 +65,7 @@ export default function Home() {
             <Shield className="w-8 h-8" />
           </div>
           <h1 className="text-4xl font-bold text-slate-900 mb-2">
-            LeviProof
+            LeviGuard
           </h1>
           <p className="text-lg text-slate-600">
             Zero-Knowledge Finfluencer Evidence Portal
@@ -212,7 +212,7 @@ export default function Home() {
 
         <div className="mt-8 text-center text-xs text-slate-500">
           <p>
-            LeviProof is an open-source public utility. We do not provide legal
+            LeviGuard is an open-source public utility. We do not provide legal
             advice.
           </p>
           <p className="mt-1">
